@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.2.0",
+    "date": "2026-10-03",
+    "title": "Lists from the panel",
+    "changes": [
+      "Reads hand-written TODOS.md files: any heading level, plain bullets, continued lines",
+      "Create, rename and remove lists right from the panel",
+      "Collapse a whole list from the marker on its title",
+      "Delete a selected todo with its sub-items; Ctrl+Z brings it back",
+      "Wheel scrolling no longer snaps back; wrapped todos stay fully visible",
+      "Fixed clicks landing on the wrong row after renaming or adding a list"
+    ]
+  },
+  {
     "version": "0.1.0",
     "date": "2026-10-03",
     "title": "First usable todos panel",

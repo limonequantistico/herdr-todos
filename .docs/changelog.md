@@ -143,3 +143,23 @@
   - ran `/push` — first commit, pushed to github.com/limonequantistico/herdr-todos
 
 ---  `v0.1.0 released`
+
+### 02:46
+
+  - reads hand-written TODOS.md files: list headings at any level, plain bullets, continued lines, an unnamed list before any heading (checked on cogi's real file)
+  - lists from the panel: + New list, click a title to rename, clear an empty one to remove it (45 tests)
+
+### 02:51
+
+  - wheel scrolling no longer snaps back to the cursor; a focused wrapped todo stays fully on screen
+  - lists collapse from a marker on their title (magenta / amber), Done included (47 tests)
+
+### 03:00
+
+  - delete key removes the selected todo with its sub-items; ctrl+z restores it (49 tests)
+
+### 03:05
+
+  - ran `/herdr-review` (Claude Opus): fixed clicks landing on the wrong row after a list rename/new list, delete/tick acting on a todo hidden in a collapsed list, empty-state hint overlapping "+ New list"; continuation-line flattening on edit left open
+
+---  `v0.2.0 released`

@@ -72,6 +72,11 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the file exists (as of the last read or write).
+    pub fn exists(&self) -> bool {
+        self.known.is_some()
+    }
+
     /// The file actually read and written (a symlink's target).
     pub fn path(&self) -> &Path {
         &self.path

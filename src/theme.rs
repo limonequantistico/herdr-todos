@@ -15,6 +15,8 @@ pub struct Theme {
     /// Cursor marker and list dots. Phosphor has no separate accent: the bar marks the cursor.
     pub accent: Color,
     pub status: Color,
+    /// The collapse marker on list titles, distinct from the one on todos (`accent`).
+    pub list_marker: Color,
     /// Whether the cursor row is drawn as a full-width solid bar.
     pub cursor_bar: bool,
 }
@@ -28,6 +30,7 @@ pub const PLAIN: Theme = Theme {
     panel: Color::Blue,
     accent: Color::Cyan,
     status: Color::Yellow,
+    list_marker: Color::Magenta,
     cursor_bar: false,
 };
 
@@ -40,5 +43,7 @@ pub const PHOSPHOR: Theme = Theme {
     panel: Color::Rgb(18, 48, 22),
     accent: Color::Rgb(105, 255, 125),
     status: Color::Rgb(62, 112, 60),
+    // Amber, the Pip-Boy's other screen colour: stands apart from the greens.
+    list_marker: Color::Rgb(255, 182, 66),
     cursor_bar: true,
 };

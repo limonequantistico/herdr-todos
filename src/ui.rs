@@ -28,6 +28,8 @@ pub enum RowKind {
     New,
     /// "+ Add a to-do" at the end of a list: click to start writing there.
     AddHere,
+    /// "+ New list", after the last list before Done.
+    NewList,
     /// Placeholder for an empty Done list.
     Empty,
     Gap,
@@ -113,6 +115,12 @@ pub fn collapse_key(doc: &Doc, at: &ItemRef) -> String {
     key
 }
 
+/// Identifies a collapsed list by its name. Todo keys always contain `\u{1f}`, list keys never
+/// do, so the two can share one set.
+pub fn list_collapse_key(name: &str) -> String {
+    format!("\u{1e}{name}")
+}
+
 /// Split `text` into rows of at most `width` chars, breaking after a space where possible.
 /// Returns (char offset, piece) pairs; always at least one, so an empty todo still has a row.
 pub fn wrap(text: &str, width: usize) -> Vec<(usize, String)> {
@@ -138,6 +146,27 @@ fn count_items(entries: &[Entry]) -> usize {
 pub fn rows(doc: &Doc, view: &View) -> Vec<Row> {
     let order = doc.display_order();
     let mut rows = Vec::new();
+    // "+ New list" goes after the last list that isn't Done (or first, if there's none).
+    let last_open = order.iter().rposition(|&l| !doc.lists[l].is_done());
+    let new_list_row = |list: usize, slot: usize| Row {
+        kind: RowKind::NewList,
+        list,
+        at: None,
+        depth: 0,
+        text: String::new(),
+        offset: 0,
+        done: false,
+        marker: None,
+        marker_col: 0,
+        opens: false,
+        drop: Place { list, parent: Vec::new(), slot },
+    };
+    if last_open.is_none() {
+        rows.push(new_list_row(order.first().copied().unwrap_or(0), 0));
+        if !order.is_empty() {
+            rows.push(Row { kind: RowKind::Gap, ..new_list_row(order[0], 0) });
+        }
+    }
     for (n, &li) in order.iter().enumerate() {
         let list = &doc.lists[li];
         let plain = |kind, text: &str, slot| Row {
@@ -153,13 +182,27 @@ pub fn rows(doc: &Doc, view: &View) -> Vec<Row> {
             opens: false,
             drop: Place { list: li, parent: Vec::new(), slot },
         };
-        rows.push(plain(RowKind::Title, &list.name, list.start_slot()));
-        let before = rows.len();
-        push_items(&mut rows, view, &list.entries, li, &[], &list.name);
-        if !list.is_done() {
-            rows.push(plain(RowKind::AddHere, "", list.end_slot()));
-        } else if rows.len() == before {
-            rows.push(plain(RowKind::Empty, "", list.end_slot()));
+        // Lists with todos get a collapse marker at the right edge of their title.
+        let count = count_items(&list.entries);
+        let collapsed = count > 0 && view.collapsed.contains(&list_collapse_key(&list.name));
+        let mut title = plain(RowKind::Title, &list.name, list.start_slot());
+        if count > 0 {
+            let marker = if collapsed { format!("⏵ {count}") } else { "⏷".to_string() };
+            title.marker_col = view.width.saturating_sub(marker.chars().count() as u16 + 1);
+            title.marker = Some(marker);
+        }
+        rows.push(title);
+        if !collapsed {
+            let before = rows.len();
+            push_items(&mut rows, view, &list.entries, li, &[], &list.name);
+            if !list.is_done() {
+                rows.push(plain(RowKind::AddHere, "", list.end_slot()));
+            } else if rows.len() == before {
+                rows.push(plain(RowKind::Empty, "", list.end_slot()));
+            }
+        }
+        if last_open == Some(n) {
+            rows.push(new_list_row(li, list.end_slot()));
         }
         if n + 1 < order.len() {
             rows.push(plain(RowKind::Gap, "", list.end_slot()));
@@ -194,9 +237,10 @@ fn push_items(rows: &mut Vec<Row>, view: &View, entries: &[Entry], list: usize, 
         let hidden = count_items(&item.children);
         let collapsed = hidden > 0 && view.collapsed.contains(&key);
         let marker = (hidden > 0).then(|| if collapsed { format!("⏵ {hidden}") } else { "⏷".to_string() });
+        let saved = item.full_text();
         let text = match (view.editing, &view.live) {
             (Some(e), Some(live)) if *e == at => live.as_str(),
-            _ => item.text.as_str(),
+            _ => saved.as_str(),
         };
         // Keep the text clear of the marker at the right edge, with a two-column gap.
         let marker_len = marker.as_ref().map_or(0, |m| m.chars().count());
@@ -353,8 +397,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         rows.insert(at, Row { kind: RowKind::Slot, at: None, depth, text: String::new(), offset: 0, done: false, marker: None, marker_col: 0, opens: false, ..target });
     }
     if app.doc.lists.is_empty() {
-        let hint = Rect { y: area.y + LIST_TOP, height: 1, ..area };
-        f.render_widget(Paragraph::new(Span::styled("No TODOS.md here yet. Add a to-do to start one.", dim)), hint);
+        // Below the "+ New list" row and its gap, which take the first two lines.
+        let hint = Rect { y: area.y + LIST_TOP + 2, height: 1, ..area };
+        let msg = if app.has_file() {
+            "No todos in TODOS.md yet. Add one above, or start a list."
+        } else {
+            "No TODOS.md here yet. Add a to-do to start one."
+        };
+        f.render_widget(Paragraph::new(Span::styled(msg, dim)), hint);
     }
     let height = list_height(area);
     let block = current_block(app, &rows);
@@ -372,8 +422,30 @@ pub fn draw(f: &mut Frame, app: &App) {
             RowKind::Title => {
                 let name_style = if app.doc.lists[row.list].is_done() { dim } else { base };
                 spans.push(Span::styled("● ", base.fg(t.accent)));
-                spans.push(Span::styled(row.text.clone(), name_style.add_modifier(Modifier::BOLD)));
+                match &app.focus {
+                    Focus::EditList { list, line } if *list == row.list => {
+                        spans.push(Span::styled(line.text(), base.add_modifier(Modifier::BOLD)));
+                        f.set_cursor_position(Position { x: area.x + 2 + line.cursor_col(), y });
+                    }
+                    _ => spans.push(Span::styled(row.text.clone(), name_style.add_modifier(Modifier::BOLD))),
+                }
+                if let Some(marker) = &row.marker {
+                    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                    spans.push(Span::styled(" ".repeat((row.marker_col as usize).saturating_sub(used)), base));
+                    spans.push(Span::styled(marker.clone(), base.fg(t.list_marker).add_modifier(Modifier::BOLD)));
+                }
             }
+            RowKind::NewList => match &app.focus {
+                Focus::NewList { line } => {
+                    spans.push(Span::styled("● ", base.fg(t.accent)));
+                    spans.push(Span::styled(line.text(), base.add_modifier(Modifier::BOLD)));
+                    f.set_cursor_position(Position { x: area.x + 2 + line.cursor_col(), y });
+                }
+                _ => {
+                    spans.push(Span::styled("+ ", dim));
+                    spans.push(Span::styled("New list", dim.add_modifier(Modifier::UNDERLINED)));
+                }
+            },
             RowKind::Empty => spans.push(Span::styled("  nothing here", dim.add_modifier(Modifier::ITALIC))),
             RowKind::Gap => {}
             RowKind::Slot => {
@@ -462,7 +534,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         let y = (*pointer_y).clamp(area.y + LIST_TOP, area.bottom().saturating_sub(2));
         let ghost_style = if t.cursor_bar { bar } else { Style::new().bg(t.accent).fg(t.on_bar).add_modifier(Modifier::BOLD) };
         let lead = (SUB_INDENT * drop_depth).min(area.width);
-        let text = format!("⠿ {} {}", if item.done { "[x]" } else { "[ ]" }, item.text);
+        let text = format!("⠿ {} {}", if item.done { "[x]" } else { "[ ]" }, item.full_text());
         // Pad to the full width so the ghost covers the drop slot under it.
         let text = format!("{text:<width$}", width = (area.width - lead) as usize);
         let ghost = Rect { x: area.x + lead, y, width: area.width - lead, height: 1 };
@@ -475,6 +547,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         (Some(msg), _) => Span::styled(msg.clone(), base.fg(t.status)),
         (None, Focus::Input) => Span::styled("enter add · esc done", dim),
         (None, Focus::Edit { .. } | Focus::New { .. }) => Span::styled("enter next line · tab nest · shift+tab unnest · esc done", dim),
+        (None, Focus::EditList { .. } | Focus::NewList { .. }) => Span::styled("enter save · esc done · clear an empty list's name to remove it", dim),
         (None, Focus::List) => Span::styled("click to write · drag to move · click [ ] to tick · ctrl+z undo", dim),
     };
     f.render_widget(Paragraph::new(Line::from(status)), status_area);
@@ -556,5 +629,18 @@ mod tests {
             })
             .collect();
         assert_eq!(drawn, ["p", "│ c1", "│ ╰ g1", "│ c2", "╰ ╰ g2", "q"]);
+    }
+
+    #[test]
+    fn a_collapsed_list_shows_only_its_title_with_a_count() {
+        let doc = Doc::parse("## A\n- [ ] a1\n  - [ ] a11\n- [ ] a2\n\n## B\n- [ ] b1\n");
+        let mut collapsed = HashSet::new();
+        collapsed.insert(list_collapse_key("A"));
+        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, width: 40 };
+        let shown: Vec<(RowKind, String, Option<String>)> =
+            rows(&doc, &view).into_iter().map(|r| (r.kind, r.text, r.marker)).collect();
+        assert_eq!(shown[0], (RowKind::Title, "A".into(), Some("⏵ 3".into())));
+        assert_eq!(shown[1].0, RowKind::Gap, "no todos, no add row");
+        assert_eq!(shown[2], (RowKind::Title, "B".into(), Some("⏷".into())));
     }
 }

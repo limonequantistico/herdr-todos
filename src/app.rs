@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use crate::clipboard;
 use crate::doc::{Doc, Entry, ItemRef, Place, items_in};
 use crate::store::{Freshness, Store};
-use crate::ui::{self, LIST_TOP, Row, RowKind, View, collapse_key};
+use crate::ui::{self, LIST_TOP, Row, RowKind, View, collapse_key, list_collapse_key};
 
 /// How many changes undo remembers.
 const HISTORY: usize = 200;
@@ -146,6 +146,10 @@ pub enum Focus {
     Edit { at: ItemRef, line: LineEdit },
     /// Writing a new todo at `place`; it joins the file once it has text.
     New { place: Place, line: LineEdit },
+    /// Renaming list `list` (clearing an empty list's name removes it).
+    EditList { list: usize, line: LineEdit },
+    /// Naming a new list.
+    NewList { line: LineEdit },
 }
 
 #[derive(Debug, Clone)]
@@ -179,8 +183,11 @@ pub struct App {
     /// are dropped when the file changes on disk, so undo never reverts someone else's edit.
     history: Vec<Doc>,
     future: Vec<Doc>,
-    /// Counts reloads of an outside change. Code that computed rows or places before a save
-    /// compares it across the save: a reload in between makes those positions stale.
+    /// The list the last `commit` of a new list created, so Return can start writing in it.
+    last_new_list: Option<usize>,
+    /// Counts changes that move rows around under code that computed positions before a
+    /// save: reloading an outside change, or removing a list. Compared across a save, a
+    /// change in between makes those positions stale.
     reloads: u64,
     /// A change on disk that arrived mid-gesture or mid-writing, applied once it ends.
     reload_pending: bool,
@@ -205,6 +212,7 @@ impl App {
             history: Vec::new(),
             future: Vec::new(),
             reloads: 0,
+            last_new_list: None,
             reload_pending: false,
             area: Rect::default(),
         };
@@ -215,14 +223,28 @@ impl App {
         Ok(app)
     }
 
+    /// Whether TODOS.md exists here.
+    pub fn has_file(&self) -> bool {
+        self.store.exists()
+    }
+
     /// The TODOS.md being shown (after following a symlink).
     pub fn file(&self) -> &Path {
         self.store.path()
     }
 
+    /// Called before every frame. Only keeps the scroll in range: following the cursor here
+    /// would undo every mouse-wheel scroll on the next frame. The cursor is followed when
+    /// something actually moves it (`keep_visible` after keys, clicks and edits).
     pub fn set_area(&mut self, area: Rect) {
+        let resized = area != self.area;
         self.area = area;
-        self.keep_visible();
+        if resized {
+            self.keep_visible();
+        } else {
+            let max = self.layout().len().saturating_sub(ui::list_height(area));
+            self.scroll = self.scroll.min(max);
+        }
     }
 
     pub fn dragged(&self) -> Option<&ItemRef> {
@@ -261,7 +283,7 @@ impl App {
     }
 
     fn writing(&self) -> bool {
-        matches!(self.focus, Focus::Edit { .. } | Focus::New { .. })
+        matches!(self.focus, Focus::Edit { .. } | Focus::New { .. } | Focus::EditList { .. } | Focus::NewList { .. })
     }
 
     fn say(&mut self, msg: impl Into<String>) {
@@ -278,16 +300,19 @@ impl App {
     fn keep_visible(&mut self) {
         let rows = self.layout();
         let height = ui::list_height(self.area).max(1);
-        let focus_row = match &self.focus {
-            Focus::Edit { at, .. } => rows.iter().position(|r| r.at.as_ref() == Some(at)),
-            Focus::New { .. } => rows.iter().position(|r| r.kind == RowKind::New),
-            _ => rows.iter().position(|r| r.at.is_some() && r.at == self.cursor),
+        let is_focus = |r: &Row| match &self.focus {
+            Focus::Edit { at, .. } => r.at.as_ref() == Some(at),
+            Focus::New { .. } => r.kind == RowKind::New,
+            Focus::EditList { list, .. } => r.kind == RowKind::Title && r.list == *list,
+            Focus::NewList { .. } => r.kind == RowKind::NewList,
+            _ => r.at.is_some() && r.at == self.cursor,
         };
-        if let Some(i) = focus_row {
-            if i < self.scroll {
-                self.scroll = i.saturating_sub(1);
-            } else if i >= self.scroll + height {
-                self.scroll = i + 1 - height;
+        // All rows of the focused todo (a wrapped one has several) should be on screen.
+        if let (Some(first), Some(last)) = (rows.iter().position(is_focus), rows.iter().rposition(is_focus)) {
+            if first < self.scroll {
+                self.scroll = first.saturating_sub(1);
+            } else if last >= self.scroll + height {
+                self.scroll = (last + 1 - height).min(first);
             }
         }
         self.scroll = self.scroll.min(rows.len().saturating_sub(height));
@@ -397,7 +422,7 @@ impl App {
 
     fn start_edit(&mut self, at: ItemRef, pos: usize) {
         if let Some(item) = self.doc.item(&at) {
-            let line = LineEdit::at(&item.text, pos);
+            let line = LineEdit::at(&item.full_text(), pos);
             self.cursor = Some(at.clone());
             self.focus = Focus::Edit { at, line };
             self.keep_visible();
@@ -405,6 +430,10 @@ impl App {
     }
 
     fn start_new(&mut self, place: Place) {
+        // Writing into a collapsed list opens it, so the new line is visible.
+        if let Some(list) = self.doc.lists.get(place.list) {
+            self.collapsed.remove(&list_collapse_key(&list.name));
+        }
         self.focus = Focus::New { place, line: LineEdit::default() };
         self.keep_visible();
     }
@@ -427,7 +456,7 @@ impl App {
                     removed.then(|| rows.iter().position(|r| r.at.as_ref() == Some(&at))).flatten()
                 } else {
                     // An untouched line is never rewritten, even if trimming would change it.
-                    let untouched = self.doc.item(&at).is_none_or(|item| item.text == line.text() || item.text == text);
+                    let untouched = self.doc.item(&at).is_none_or(|item| item.full_text() == line.text() || item.full_text() == text);
                     if !untouched
                         && self
                             .apply(|doc| {
@@ -452,6 +481,53 @@ impl App {
                     None
                 }
             }
+            Focus::EditList { list, line } => {
+                let name = line.text().trim().to_string();
+                if name.is_empty() {
+                    // Clearing a list's name removes it, but only if it's empty.
+                    let mut removed = false;
+                    let _ = self.apply(|doc| {
+                        removed = doc.remove_list(list);
+                        None
+                    });
+                    if removed {
+                        self.reloads += 1; // rows below it moved up
+                    } else {
+                        self.say("a list with todos in it can't be removed");
+                    }
+                } else if self.doc.lists.get(list).is_some_and(|l| l.name != name || l.is_implicit()) {
+                    let old = self.doc.lists[list].name.clone();
+                    if self
+                        .apply(|doc| {
+                            doc.rename_list(list, &name);
+                            None
+                        })
+                        .is_ok()
+                    {
+                        // Keep it collapsed under its new name, and mark the layout as moved.
+                        if self.collapsed.remove(&list_collapse_key(&old)) {
+                            self.collapsed.insert(list_collapse_key(&name));
+                        }
+                        self.reloads += 1;
+                    }
+                }
+                None
+            }
+            Focus::NewList { line } => {
+                let name = line.text().trim().to_string();
+                if !name.is_empty() {
+                    let mut created = None;
+                    let _ = self.apply(|doc| {
+                        created = Some(doc.add_list(&name));
+                        None
+                    });
+                    if created.is_some() {
+                        self.reloads += 1; // new rows above anything below it
+                    }
+                    self.last_new_list = created;
+                }
+                None
+            }
             other => {
                 self.focus = other;
                 None
@@ -464,6 +540,16 @@ impl App {
     /// Return while writing: save, then open a new line right below at the same level.
     /// Return on an empty line just stops.
     fn next_line(&mut self) {
+        if let Focus::NewList { .. } = self.focus {
+            self.last_new_list = None;
+            self.commit();
+            // Straight into the new list's first todo.
+            if let Some(list) = self.last_new_list.take() {
+                let slot = self.doc.lists[list].start_slot();
+                self.start_new(Place { list, parent: Vec::new(), slot });
+            }
+            return;
+        }
         let below = match &self.focus {
             Focus::Edit { at, line } if !line.text().trim().is_empty() => {
                 // A ticked item in Done gets no new line under it: new todos don't start done.
@@ -598,10 +684,12 @@ impl App {
         if undo && self.writing() {
             // First undo the typing in this line; once it's back as it was, undo file changes.
             let saved = match &self.focus {
-                Focus::Edit { at, .. } => self.doc.item(at).map(|i| i.text.clone()).unwrap_or_default(),
+                Focus::Edit { at, .. } => self.doc.item(at).map(|i| i.full_text()).unwrap_or_default(),
+                Focus::EditList { list, .. } => self.doc.lists.get(*list).map(|l| l.name.clone()).unwrap_or_default(),
                 _ => String::new(),
             };
-            if let Focus::Edit { line, .. } | Focus::New { line, .. } = &mut self.focus
+            if let Focus::Edit { line, .. } | Focus::New { line, .. } | Focus::EditList { line, .. } | Focus::NewList { line } =
+                &mut self.focus
                 && line.text() != saved
             {
                 *line = LineEdit::at(&saved, usize::MAX);
@@ -621,10 +709,25 @@ impl App {
                 EditOutcome::Submit if !self.input.text().trim().is_empty() => {
                     let text = self.input.text().trim().to_string();
                     self.input.clear();
-                    let _ = self.apply(|doc| Some(doc.add(&text)));
+                    if let Ok(Some(at)) = self.apply(|doc| Some(doc.add(&text))) {
+                        // Show where it went, even if General was collapsed.
+                        let name = self.doc.lists[at.list].name.clone();
+                        self.collapsed.remove(&list_collapse_key(&name));
+                        self.keep_visible();
+                    }
                 }
                 EditOutcome::Submit | EditOutcome::Cancel => self.focus = Focus::List,
                 EditOutcome::Typing => {}
+            },
+            Focus::EditList { line, .. } | Focus::NewList { line } => match key.code {
+                KeyCode::Enter => self.next_line(),
+                KeyCode::Esc => {
+                    self.commit();
+                }
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {}
+                _ => {
+                    line.key(key);
+                }
             },
             Focus::Edit { line, .. } | Focus::New { line, .. } => match key.code {
                 KeyCode::Enter => self.next_line(),
@@ -641,6 +744,10 @@ impl App {
                 }
             },
             Focus::List => self.list_key(key),
+        }
+        // Typing can grow a wrapped line past the bottom: keep it on screen.
+        if self.writing() {
+            self.keep_visible();
         }
     }
 
@@ -666,7 +773,7 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.cursor = refs.first().cloned(),
             KeyCode::Char('G') | KeyCode::End => self.cursor = refs.last().cloned(),
-            KeyCode::Char(' ') | KeyCode::Char('x') => {
+            KeyCode::Char(' ') | KeyCode::Char('x') if pos.is_some() => {
                 if let Some(at) = cursor {
                     let _ = self.apply(|doc| doc.toggle(&at));
                 }
@@ -688,10 +795,36 @@ impl App {
             }
             KeyCode::Char('J') => self.shift(1),
             KeyCode::Char('K') => self.shift(-1),
+            // Delete the selected todo (Backspace is the Mac "delete" key; fn+delete is Delete).
+            // Only a todo you can see: never one hidden in a collapsed list.
+            KeyCode::Delete | KeyCode::Backspace if pos.is_some() => {
+                if let Some(at) = cursor {
+                    self.delete(&at);
+                }
+            }
             KeyCode::Esc => self.gesture = Gesture::None,
             _ => {}
         }
         self.keep_visible();
+    }
+
+    /// Delete a todo with everything under it, and say how to get it back.
+    fn delete(&mut self, at: &ItemRef) {
+        let mut gone = None;
+        if self
+            .apply(|doc| {
+                let (item, next) = doc.delete(at)?;
+                gone = Some(item);
+                next
+            })
+            .is_ok()
+            && let Some(item) = gone
+        {
+            let nested = item.children.iter().filter(|c| matches!(c, crate::doc::Entry::Item(_))).count();
+            let text: String = item.full_text().chars().take(30).collect();
+            let more = if nested > 0 { format!(" and {nested} sub-item{}", if nested == 1 { "" } else { "s" }) } else { String::new() };
+            self.say(format!("deleted “{text}”{more} · ctrl+z to undo"));
+        }
     }
 
     /// Move the cursor item one place down (`1`) or up (`-1`) among its siblings. Top-level
@@ -796,6 +929,23 @@ impl App {
         let col = m.column.saturating_sub(self.area.x);
         match row.kind {
             RowKind::AddHere => self.start_new(row.drop.clone()),
+            RowKind::NewList => {
+                self.focus = Focus::NewList { line: LineEdit::default() };
+                self.keep_visible();
+            }
+            // The marker at the right edge of a list title collapses or opens the list.
+            RowKind::Title if row.marker.is_some() && col + 1 >= row.marker_col => {
+                let key = list_collapse_key(&row.text);
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+            }
+            // Click a list's name to rename it (Done keeps its name: it's what makes it Done).
+            RowKind::Title if !self.doc.lists[row.list].is_done() => {
+                let pos = col.saturating_sub(2) as usize;
+                let line = LineEdit::at(&row.text, pos);
+                self.focus = Focus::EditList { list: row.list, line };
+            }
             RowKind::Item => {
                 let Some(at) = row.at.clone() else { return };
                 if col < row.lead() {
@@ -1019,5 +1169,65 @@ mod tests {
         key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.quit);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "## A\n- [ ] one\n- [ ] two\n");
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            key(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn new_list_then_its_first_todos_by_typing() {
+        let (mut app, file) = panel("newlist", "### Work\n- a\n\n### Done\n- [x] d\n");
+        app.focus = Focus::NewList { line: LineEdit::default() };
+        type_text(&mut app, "Home");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // creates the list, opens its first line
+        type_text(&mut app, "milk");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        type_text(&mut app, "bread");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // empty line: stop
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "### Work\n- a\n\n### Home\n- milk\n- bread\n\n### Done\n- [x] d\n");
+    }
+
+    #[test]
+    fn renaming_and_removing_a_list() {
+        let (mut app, file) = panel("rename", "## Work\n- a\n\n## Empty\n");
+        app.focus = Focus::EditList { list: 0, line: LineEdit::at("Work", usize::MAX) };
+        type_text(&mut app, "!");
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(std::fs::read_to_string(&file).unwrap().starts_with("## Work!\n"));
+        app.focus = Focus::EditList { list: 1, line: LineEdit::at("Empty", usize::MAX) };
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## Work!\n- a\n\n");
+    }
+
+    #[test]
+    fn a_wheel_scroll_is_not_undone_by_the_next_frame() {
+        let many: String = (0..40).map(|i| format!("- [ ] todo {i}\n")).collect();
+        let (mut app, _) = panel("scroll", &format!("## A\n{many}"));
+        let area = Rect { x: 0, y: 0, width: 40, height: 12 };
+        app.set_area(area);
+        assert_eq!(app.scroll, 0);
+        for _ in 0..3 {
+            app.on_mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column: 5, row: 5, modifiers: KeyModifiers::NONE });
+            app.set_area(area); // the redraw after each event
+        }
+        assert_eq!(app.scroll, 9, "the cursor stayed on todo 0, the view still moved");
+    }
+
+    #[test]
+    fn delete_key_removes_the_selected_todo_and_undo_brings_it_back() {
+        let text = "## A\n- [ ] a\n- [ ] b\n  - [ ] b1\n";
+        let (mut app, file) = panel("delete", text);
+        app.cursor = Some(ItemRef::top(0, 1));
+        key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## A\n- [ ] a\n");
+        assert_eq!(app.status.as_deref(), Some("deleted “b” and 1 sub-item · ctrl+z to undo"));
+        assert_eq!(app.cursor, Some(ItemRef::top(0, 0)));
+        key(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
     }
 }

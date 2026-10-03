@@ -1,9 +1,15 @@
 //! The `TODOS.md` document: parsing, writing back, and the list operations.
 //!
-//! Format: every `## Heading` starts a list; `- [ ] text` / `- [x] text` lines are items;
-//! deeper-indented items are sub-items of the item above. Every other line (notes, blank
-//! lines, other markdown) is kept exactly where it was. Items the panel hasn't changed are
-//! written back byte for byte, so opening the panel never reformats anyone's file.
+//! Format, read loosely so most hand-written TODOS.md files work as they are:
+//! - Lists are headings at the level the file uses for them: `##` usually, `###` if that's the
+//!   shallowest below the title, `#` when a file has several top-level headings.
+//! - Items are bullets: `- [ ] text`, `- [x] text`, or plain `- text` (an open todo). Indented
+//!   bullets are sub-items; indented text right under an item continues its text.
+//! - Bullets before the first list heading form an unnamed list, shown as General.
+//!
+//! Every other line (notes, blank lines, other markdown) is kept exactly where it was. Items
+//! the panel hasn't changed are written back byte for byte, so opening the panel never
+//! reformats anyone's file.
 
 pub const GENERAL: &str = "General";
 pub const DONE: &str = "Done";
@@ -16,6 +22,8 @@ pub struct Doc {
     pub trailing_newline: bool,
     /// Whether the file uses Windows line endings, so writing keeps them.
     crlf: bool,
+    /// The heading level of lists (2 for `##`). New lists are written at this level.
+    level: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +32,8 @@ pub struct List {
     /// The heading line as written, if unchanged.
     raw: Option<String>,
     pub entries: Vec<Entry>,
+    /// The unnamed list of bullets before any list heading: it has no heading line.
+    implicit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,10 +46,15 @@ pub enum Entry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
     pub done: bool,
+    /// The text on the item's own line. `full_text` adds any continuation lines.
     pub text: String,
     pub children: Vec<Entry>,
     indent: String,
     bullet: char,
+    /// Whether the line has a `[ ]` box; plain bullets don't until they're ticked.
+    checkbox: bool,
+    /// Indented lines right below the item that continue its text, kept as written.
+    cont: Vec<String>,
     /// The line as written; dropped as soon as the item changes, so it's re-rendered.
     raw: Option<String>,
 }
@@ -53,6 +68,7 @@ pub struct ItemRef {
 }
 
 impl ItemRef {
+    #[cfg(test)]
     pub fn top(list: usize, entry: usize) -> Self {
         ItemRef { list, path: vec![entry] }
     }
@@ -88,8 +104,20 @@ impl Item {
             children: Vec::new(),
             indent: String::new(),
             bullet: '-',
+            checkbox: true,
+            cont: Vec::new(),
             raw: None,
         }
+    }
+
+    /// The whole text, continuation lines included, as the panel shows it.
+    pub fn full_text(&self) -> String {
+        let mut text = self.text.clone();
+        for line in &self.cont {
+            text.push(' ');
+            text.push_str(line.trim());
+        }
+        text
     }
 
     fn indent_width(&self) -> usize {
@@ -114,6 +142,9 @@ impl Item {
             Some(rest) => format!("{indent}{rest}"),
             None => format!("{indent}  {}", line.trim_start()),
         };
+        for line in &mut self.cont {
+            *line = shift(line);
+        }
         for child in &mut self.children {
             match child {
                 Entry::Item(sub) => {
@@ -134,11 +165,16 @@ pub fn items_in(entries: &[Entry]) -> impl Iterator<Item = usize> + '_ {
 
 impl List {
     fn new(name: &str) -> Self {
-        List { name: name.to_string(), raw: None, entries: Vec::new() }
+        List { name: name.to_string(), raw: None, entries: Vec::new(), implicit: false }
     }
 
     pub fn is_done(&self) -> bool {
         self.name.eq_ignore_ascii_case(DONE)
+    }
+
+    /// Whether this is the unnamed list of bullets before any heading.
+    pub fn is_implicit(&self) -> bool {
+        self.implicit
     }
 
     #[cfg(test)]
@@ -169,25 +205,67 @@ fn indent_width(indent: &str) -> usize {
     indent.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
 }
 
-/// `- [ ] text` → (indent, bullet, done, text).
-fn parse_item(line: &str) -> Option<(String, char, bool, String)> {
+struct Parsed {
+    indent: String,
+    bullet: char,
+    checkbox: bool,
+    done: bool,
+    text: String,
+}
+
+/// `- [ ] text`, `- [x] text`, or a plain `- text`.
+fn parse_item(line: &str) -> Option<Parsed> {
     let body = line.trim_start();
     let indent = line[..line.len() - body.len()].to_string();
     let mut chars = body.chars();
     let bullet = chars.next().filter(|c| matches!(c, '-' | '*' | '+'))?;
     let rest = chars.as_str().strip_prefix(' ')?;
-    let done = match rest.get(..3)? {
-        "[ ]" => false,
-        "[x]" | "[X]" => true,
-        _ => return None,
-    };
-    let after = &rest[3..];
-    let text = match after.strip_prefix(' ') {
-        Some(text) => text,
-        None if after.is_empty() => "",
-        None => return None,
-    };
-    Some((indent, bullet, done, text.to_string()))
+    // A thematic break (`- - -`, `* * *`) is not a todo.
+    if rest.chars().all(|c| c == bullet || c == ' ') {
+        return None;
+    }
+    let boxed = |done, after: &str| Parsed { indent: indent.clone(), bullet, checkbox: true, done, text: after.to_string() };
+    for (mark, done) in [("[ ]", false), ("[x]", true), ("[X]", true)] {
+        if let Some(after) = rest.strip_prefix(mark) {
+            if after.is_empty() {
+                return Some(boxed(done, ""));
+            }
+            if let Some(text) = after.strip_prefix(' ') {
+                return Some(boxed(done, text));
+            }
+        }
+    }
+    Some(Parsed { indent, bullet, checkbox: false, done: false, text: rest.to_string() })
+}
+
+/// The level of a markdown heading line (`## x` → 2).
+fn heading_level(line: &str) -> Option<usize> {
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    ((1..=6).contains(&hashes) && line[hashes..].starts_with(' ')).then_some(hashes)
+}
+
+/// Which heading level the file uses for lists: the shallowest below the title, or `#`
+/// when there are several top-level headings and nothing deeper; `##` for a new file.
+fn list_level(text: &str) -> usize {
+    let levels: Vec<usize> = text.lines().filter_map(heading_level).collect();
+    match levels.iter().filter(|&&l| l >= 2).min() {
+        Some(&l) => l,
+        None if levels.iter().filter(|&&l| l == 1).count() >= 2 => 1,
+        None => 2,
+    }
+}
+
+/// The item an indented text line continues: the deepest last item it's indented under,
+/// as long as nothing (no sub-item, note or blank line) came in between.
+fn continued(entries: &mut [Entry], width: usize) -> Option<&mut Item> {
+    let Some(Entry::Item(last)) = entries.last_mut() else { return None };
+    if width <= last.indent_width() {
+        return None;
+    }
+    if last.children.is_empty() {
+        return Some(last);
+    }
+    continued(&mut last.children, width)
 }
 
 /// Push `entry` into `entries`, nesting it under the last item if it's indented deeper.
@@ -200,39 +278,71 @@ fn place(entries: &mut Vec<Entry>, entry: Entry, width: usize) {
     entries.push(entry);
 }
 
+fn first_item(entries: &[Entry]) -> Option<&Entry> {
+    items_in(entries).next().map(|i| &entries[i])
+}
+
 impl Doc {
     pub fn empty() -> Self {
-        Doc { preamble: Vec::new(), lists: Vec::new(), trailing_newline: true, crlf: false }
+        Doc { preamble: Vec::new(), lists: Vec::new(), trailing_newline: true, crlf: false, level: 2 }
     }
 
     pub fn parse(text: &str) -> Self {
-        let mut doc = Doc { trailing_newline: text.is_empty() || text.ends_with('\n'), crlf: text.contains("\r\n"), ..Doc::empty() };
+        let level = list_level(text);
+        let mut doc = Doc { trailing_newline: text.is_empty() || text.ends_with('\n'), crlf: text.contains("\r\n"), level, ..Doc::empty() };
         // Blank lines wait for the next line to see where they belong: a blank line between
         // two sub-items ("loose" markdown lists) stays inside their parent, so the second
         // sub-item still nests.
         let mut blanks: Vec<Entry> = Vec::new();
         for line in text.lines() {
-            if let Some(name) = line.strip_prefix("## ") {
+            if heading_level(line) == Some(level) {
                 if let Some(list) = doc.lists.last_mut() {
                     list.entries.append(&mut blanks);
                 }
-                doc.lists.push(List { name: name.trim().to_string(), raw: Some(line.to_string()), entries: Vec::new() });
+                let name = line[level..].trim().to_string();
+                doc.lists.push(List { name, raw: Some(line.to_string()), entries: Vec::new(), implicit: false });
                 continue;
             }
-            let Some(list) = doc.lists.last_mut() else {
-                doc.preamble.push(line.to_string());
-                continue;
-            };
-            let (entry, width) = match parse_item(line) {
-                Some((indent, bullet, done, text)) => {
-                    let width = indent_width(&indent);
-                    (Entry::Item(Item { done, text, children: Vec::new(), indent, bullet, raw: Some(line.to_string()) }), width)
+            let item = parse_item(line);
+            if doc.lists.is_empty() {
+                if item.is_none() {
+                    doc.preamble.push(line.to_string());
+                    continue;
+                }
+                // Bullets before any list heading: an unnamed list, shown as General.
+                doc.lists.push(List { implicit: true, ..List::new(GENERAL) });
+            }
+            let list = doc.lists.last_mut().expect("a list exists by now");
+            let (entry, width) = match item {
+                Some(p) => {
+                    let width = indent_width(&p.indent);
+                    let item = Item {
+                        done: p.done,
+                        text: p.text,
+                        children: Vec::new(),
+                        indent: p.indent,
+                        bullet: p.bullet,
+                        checkbox: p.checkbox,
+                        cont: Vec::new(),
+                        raw: Some(line.to_string()),
+                    };
+                    (Entry::Item(item), width)
                 }
                 None if line.trim().is_empty() => {
                     blanks.push(Entry::Raw(line.to_string()));
                     continue;
                 }
-                None => (Entry::Raw(line.to_string()), indent_width(&line[..line.len() - line.trim_start().len()])),
+                None => {
+                    let width = indent_width(&line[..line.len() - line.trim_start().len()]);
+                    if blanks.is_empty()
+                        && heading_level(line.trim_start()).is_none()
+                        && let Some(item) = continued(&mut list.entries, width)
+                    {
+                        item.cont.push(line.to_string());
+                        continue;
+                    }
+                    (Entry::Raw(line.to_string()), width)
+                }
             };
             for blank in blanks.drain(..) {
                 place(&mut list.entries, blank, width);
@@ -248,7 +358,9 @@ impl Doc {
     pub fn render(&self) -> String {
         let mut lines: Vec<String> = self.preamble.clone();
         for list in &self.lists {
-            lines.push(list.raw.clone().unwrap_or_else(|| format!("## {}", list.name)));
+            if !list.implicit {
+                lines.push(list.raw.clone().unwrap_or_else(|| format!("{} {}", "#".repeat(self.level), list.name)));
+            }
             render_entries(&list.entries, &mut lines);
         }
         let newline = if self.crlf { "\r\n" } else { "\n" };
@@ -378,16 +490,33 @@ impl Doc {
     /// Add a new item at the end of General. Returns where it landed.
     pub fn add(&mut self, text: &str) -> ItemRef {
         let list = self.general();
-        let entry = self.lists[list].end_slot();
-        self.lists[list].entries.insert(entry, Entry::Item(Item::new(text)));
-        ItemRef::top(list, entry)
+        let slot = self.lists[list].end_slot();
+        self.insert(&Place { list, parent: Vec::new(), slot }, text).expect("General exists")
     }
 
+    /// A new item written the way its future siblings are (or, with none yet, the file's
+    /// first open todo): same bullet, and a `[ ]` box only if they have one, so a plain-bullet
+    /// file stays plain.
+    fn new_item(&self, list: usize, parent: &[usize], text: &str) -> Item {
+        let mut item = Item::new(text);
+        item.indent = self.indent_for(list, parent);
+        let sibling = self.container(list, parent).and_then(|c| first_item(c)).or_else(|| {
+            self.lists.iter().filter(|l| !l.is_done()).find_map(|l| first_item(&l.entries))
+        });
+        if let Some(Entry::Item(s)) = sibling {
+            item.bullet = s.bullet;
+            item.checkbox = s.checkbox || s.done;
+        }
+        item
+    }
+
+    /// Replace an item's text. An item that continued over several lines becomes one line.
     pub fn edit(&mut self, at: &ItemRef, text: &str) {
         if let Some(item) = self.item_mut(at)
-            && item.text != text
+            && item.full_text() != text
         {
             item.text = text.to_string();
+            item.cont.clear();
             item.raw = None;
         }
     }
@@ -439,14 +568,35 @@ impl Doc {
 
     /// Insert a new, open item at `at` (at the indent of its new siblings).
     pub fn insert(&mut self, at: &Place, text: &str) -> Option<ItemRef> {
-        let mut item = Item::new(text);
-        item.indent = self.indent_for(at.list, &at.parent);
+        let item = self.new_item(at.list, &at.parent, text);
         let container = self.container_mut(at.list, &at.parent)?;
         let slot = at.slot.min(container.len());
         container.insert(slot, Entry::Item(item));
         let mut path = at.parent.clone();
         path.push(slot);
         Some(ItemRef { list: at.list, path })
+    }
+
+    /// Delete an item on purpose, with everything nested under it. Returns it, and where the
+    /// cursor should go next: the item that slid into its place, else the one before it, else
+    /// its parent.
+    pub fn delete(&mut self, at: &ItemRef) -> Option<(Item, Option<ItemRef>)> {
+        self.item(at)?;
+        let container = self.container_mut(at.list, at.parent())?;
+        let Entry::Item(item) = container.remove(at.index()) else { unreachable!("checked above") };
+        let items: Vec<usize> = items_in(container).collect();
+        let sibling = |i: usize| {
+            let mut path = at.parent().to_vec();
+            path.push(i);
+            ItemRef { list: at.list, path }
+        };
+        let next = items
+            .iter()
+            .find(|&&i| i >= at.index())
+            .or_else(|| items.iter().rev().find(|&&i| i < at.index()))
+            .map(|&i| sibling(i))
+            .or_else(|| (at.depth() > 0).then(|| ItemRef { list: at.list, path: at.parent().to_vec() }));
+        Some((item, next))
     }
 
     /// Remove an item with nothing under it. Items with sub-items or notes are never removed
@@ -460,6 +610,44 @@ impl Doc {
             c.remove(at.index());
             true
         })
+    }
+
+    /// Add an empty list, after the others but before Done. Returns its index.
+    pub fn add_list(&mut self, name: &str) -> usize {
+        let at = self.lists.iter().position(List::is_done).unwrap_or(self.lists.len());
+        let blank = |entries: &[Entry]| matches!(entries.last(), Some(Entry::Raw(l)) if l.trim().is_empty());
+        match at.checked_sub(1) {
+            Some(prev) if !blank(&self.lists[prev].entries) => self.lists[prev].entries.push(Entry::Raw(String::new())),
+            None if self.preamble.last().is_some_and(|l| !l.trim().is_empty()) => self.preamble.push(String::new()),
+            _ => {}
+        }
+        let mut list = List::new(name);
+        if at < self.lists.len() {
+            // Keep a blank line before the Done heading that now follows.
+            list.entries.push(Entry::Raw(String::new()));
+        }
+        self.lists.insert(at, list);
+        at
+    }
+
+    /// Rename a list. The unnamed list gets a real heading this way.
+    pub fn rename_list(&mut self, list: usize, name: &str) {
+        if let Some(l) = self.lists.get_mut(list)
+            && (l.name != name || l.implicit)
+        {
+            l.name = name.to_string();
+            l.raw = None;
+            l.implicit = false;
+        }
+    }
+
+    /// Remove a list, only if nothing but blank lines is in it.
+    pub fn remove_list(&mut self, list: usize) -> bool {
+        let empty = self.lists.get(list).is_some_and(|l| l.entries.iter().all(|e| matches!(e, Entry::Raw(x) if x.trim().is_empty())));
+        if empty {
+            self.lists.remove(list);
+        }
+        empty
     }
 
     /// Make an item the last sub-item of the item above it.
@@ -515,9 +703,15 @@ fn render_entries(entries: &[Entry], lines: &mut Vec<String>) {
             Entry::Raw(line) => lines.push(line.clone()),
             Entry::Item(item) => {
                 lines.push(item.raw.clone().unwrap_or_else(|| {
-                    let mark = if item.done { 'x' } else { ' ' };
-                    format!("{}{} [{mark}] {}", item.indent, item.bullet, item.text).trim_end().to_string()
+                    let line = if item.checkbox || item.done {
+                        let mark = if item.done { 'x' } else { ' ' };
+                        format!("{}{} [{mark}] {}", item.indent, item.bullet, item.text)
+                    } else {
+                        format!("{}{} {}", item.indent, item.bullet, item.text)
+                    };
+                    line.trim_end().to_string()
                 }));
+                lines.extend(item.cont.iter().cloned());
                 render_entries(&item.children, lines);
             }
         }
@@ -574,15 +768,23 @@ Some notes up here.
         assert!(odd.done);
         assert_eq!(odd.text, " oddly spaced");
         let marco = work.item(2).unwrap();
-        assert_eq!(marco.children, vec![Entry::Raw("  a note under Marco".into())]);
+        // An indented line right under a todo continues its text.
+        assert!(marco.children.is_empty());
+        assert_eq!(marco.full_text(), "Reply to Marco a note under Marco");
     }
 
     #[test]
-    fn not_items() {
-        for line in ["-[ ] x", "- [] x", "- [y] x", "- [ ]x", "1. [ ] x", "-  [ ] x"] {
-            assert_eq!(parse_item(line), None, "{line:?}");
+    fn which_lines_are_items() {
+        let parsed = |line| parse_item(line).map(|p| (p.checkbox, p.done, p.text));
+        for line in ["-[ ] x", "1. [ ] x", "- - -", "* * *", "text", ""] {
+            assert!(parsed(line).is_none(), "{line:?}");
         }
-        assert_eq!(parse_item("- [ ]"), Some((String::new(), '-', false, String::new())));
+        assert_eq!(parsed("- [ ]"), Some((true, false, String::new())));
+        assert_eq!(parsed("* [X] done"), Some((true, true, "done".into())));
+        // Anything else after a bullet is a plain todo, text as written.
+        assert_eq!(parsed("- plain todo"), Some((false, false, "plain todo".into())));
+        assert_eq!(parsed("- [y] x"), Some((false, false, "[y] x".into())));
+        assert_eq!(parsed("- [ ]x"), Some((false, false, "[ ]x".into())));
     }
 
     #[test]
@@ -778,5 +980,111 @@ Some notes up here.
         let mut doc = Doc::parse("## A\r\n- [ ] a\r\n- [ ] b\r\n");
         doc.edit(&sub(0, &[1]), "bee");
         assert_eq!(doc.render(), "## A\r\n- [ ] a\r\n- [ ] bee\r\n");
+    }
+
+    /// Trimmed from a real hand-written TODOS.md: `#` title, prose, `###` lists, plain
+    /// bullets, sub-bullets, and todos whose text continues on indented lines.
+    const HANDWRITTEN: &str = "\
+# TODOS
+
+Possibili task emersi dalle conversazioni.
+
+### General
+
+- valutare agenzia
+  - processa note vocali
+
+- todo plugin per herdr
+### Soldi e progetti
+
+- **Provare a spiegare uno strumento** — *\"un altra cosa da provare\"* (2026-09-21). Il test
+  è se piace anche la metà dello spiegare. Vedi [[provare-strumenti]].
+
+- iscriversi anche a micro1
+";
+
+    #[test]
+    fn reads_a_handwritten_file() {
+        let doc = Doc::parse(HANDWRITTEN);
+        assert_eq!(doc.render(), HANDWRITTEN, "unchanged on the way back");
+        assert_eq!(doc.level, 3);
+        assert_eq!(doc.lists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["General", "Soldi e progetti"]);
+        assert_eq!(doc.preamble[0], "# TODOS");
+        let general = &doc.lists[0];
+        assert_eq!(general.item_entries().count(), 2);
+        let first = general.item_entries().next().unwrap();
+        assert_eq!(doc.item(&sub(0, &[first, 0])).unwrap().text, "processa note vocali");
+        let long = doc.item(&sub(1, &[doc.lists[1].start_slot()])).unwrap();
+        assert!(long.full_text().ends_with("(2026-09-21). Il test è se piace anche la metà dello spiegare. Vedi [[provare-strumenti]]."));
+        assert!(long.children.is_empty());
+    }
+
+    #[test]
+    fn ticking_a_plain_bullet_gives_it_a_box_and_keeps_its_continuation() {
+        let mut doc = Doc::parse(HANDWRITTEN);
+        doc.toggle(&sub(1, &[doc.lists[1].start_slot()]));
+        let out = doc.render();
+        assert!(out.ends_with("### Done\n- [x] **Provare a spiegare uno strumento** — *\"un altra cosa da provare\"* (2026-09-21). Il test\n  è se piace anche la metà dello spiegare. Vedi [[provare-strumenti]].\n"), "{out}");
+    }
+
+    #[test]
+    fn editing_a_continued_todo_makes_it_one_line() {
+        let mut doc = Doc::parse("## A\n- first part\n  second part\n- next\n");
+        assert_eq!(doc.item(&sub(0, &[0])).unwrap().full_text(), "first part second part");
+        doc.edit(&sub(0, &[0]), "first part second part!");
+        assert_eq!(doc.render(), "## A\n- first part second part!\n- next\n");
+    }
+
+    #[test]
+    fn new_todos_follow_their_siblings_style() {
+        let mut doc = Doc::parse("## A\n* plain\n");
+        doc.insert(&top_level(0, 1), "also plain");
+        assert_eq!(doc.render(), "## A\n* plain\n* also plain\n");
+    }
+
+    #[test]
+    fn bullets_without_a_heading_are_an_unnamed_general_list() {
+        let mut doc = Doc::parse("# My todos\n\n- a\n- b\n");
+        assert_eq!(doc.lists.len(), 1);
+        assert_eq!(doc.lists[0].name, GENERAL);
+        doc.add("c");
+        assert_eq!(doc.render(), "# My todos\n\n- a\n- b\n- c\n");
+        doc.rename_list(0, "Home");
+        assert_eq!(doc.render(), "# My todos\n\n## Home\n- a\n- b\n- c\n");
+    }
+
+    #[test]
+    fn several_top_level_headings_are_lists() {
+        let doc = Doc::parse("# Work\n- a\n# Home\n- b\n");
+        assert_eq!(doc.lists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Work", "Home"]);
+    }
+
+    #[test]
+    fn adding_renaming_and_removing_lists() {
+        let mut doc = Doc::parse("### A\n- a\n\n### Done\n- [x] d\n");
+        let b = doc.add_list("B");
+        assert_eq!(b, 1, "before Done");
+        assert_eq!(doc.render(), "### A\n- a\n\n### B\n\n### Done\n- [x] d\n", "at the file's own level");
+        doc.insert(&top_level(1, doc.lists[1].end_slot()), "b1");
+        assert_eq!(doc.render(), "### A\n- a\n\n### B\n- b1\n\n### Done\n- [x] d\n");
+        doc.rename_list(1, "Bee");
+        assert!(doc.render().contains("### Bee\n- b1\n"));
+        assert!(!doc.remove_list(1), "has a todo");
+        doc.remove(&sub(1, &[0]));
+        assert!(doc.remove_list(1));
+        assert_eq!(doc.render(), "### A\n- a\n\n### Done\n- [x] d\n");
+    }
+
+    #[test]
+    fn delete_takes_sub_items_and_says_where_the_cursor_goes() {
+        let mut doc = Doc::parse("## A\n- [ ] a\n- [ ] b\n  - [ ] b1\n  note\n- [ ] c\n");
+        let (gone, next) = doc.delete(&sub(0, &[1])).unwrap();
+        assert_eq!(gone.text, "b");
+        assert_eq!(doc.render(), "## A\n- [ ] a\n- [ ] c\n");
+        assert_eq!(next, Some(sub(0, &[1])), "c slid into b's place");
+        let (_, next) = doc.delete(&sub(0, &[1])).unwrap();
+        assert_eq!(next, Some(sub(0, &[0])), "nothing after: the one before");
+        let mut doc = Doc::parse("## A\n- [ ] p\n  - [ ] only\n");
+        assert_eq!(doc.delete(&sub(0, &[0, 0])).unwrap().1, Some(sub(0, &[0])), "last sub-item: its parent");
     }
 }
