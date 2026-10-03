@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.4.0",
+    "date": "2026-10-03",
+    "title": "Faster capture",
+    "changes": [
+      "\"+ New list\" sits at the top, next to quick add, always in view",
+      "Press n for a new todo below the selected one, l for a new list",
+      "Long quick-add text scrolls sideways instead of running off the panel",
+      "Click inside the quick-add text to place the cursor there",
+      "Emoji and CJK text wrap and line up correctly",
+      "Fixed a click after an unnamed new list ticking the wrong todo"
+    ]
+  },
+  {
     "version": "0.3.0",
     "date": "2026-10-03",
     "title": "Panel that remembers",

@@ -178,6 +178,8 @@ pub struct App {
     pub cursor: Option<ItemRef>,
     pub focus: Focus,
     pub input: LineEdit,
+    /// The first char the quick-add box shows, when its text is too long for it.
+    pub input_scroll: usize,
     pub gesture: Gesture,
     pub status: Option<String>,
     pub phosphor: bool,
@@ -217,6 +219,7 @@ impl App {
             cursor: None,
             focus: Focus::List,
             input: LineEdit::default(),
+            input_scroll: 0,
             gesture: Gesture::None,
             status: None,
             phosphor: false,
@@ -306,10 +309,17 @@ impl App {
         self.area = area;
         if resized {
             self.keep_visible();
+            self.fit_input();
         } else {
             let max = self.layout().len().saturating_sub(ui::list_height(area));
             self.scroll = self.scroll.min(max);
         }
+    }
+
+    /// Scroll the quick-add box so its cursor shows.
+    fn fit_input(&mut self) {
+        let width = ui::input_width(self.area.width);
+        self.input_scroll = ui::input_window(&self.input.text(), self.input.cursor_col() as usize, self.input_scroll, width);
     }
 
     pub fn dragged(&self) -> Option<&ItemRef> {
@@ -337,7 +347,7 @@ impl App {
             Gesture::MoveList { from, .. } => Some(from),
             _ => None,
         };
-        View { skip, pending: self.pending(), editing, live, collapsed: &self.collapsed, moving_list, width: self.area.width }
+        View { skip, pending: self.pending(), editing, live, collapsed: &self.collapsed, moving_list, naming_list: matches!(self.focus, Focus::NewList { .. }), width: self.area.width }
     }
 
     /// The rows as currently shown (minus any drag).
@@ -435,6 +445,7 @@ impl App {
     /// Text that couldn't be saved goes into the quick-add box instead of being lost.
     fn rescue(&mut self, text: String) {
         self.input = LineEdit::at(&text, usize::MAX);
+        self.fit_input();
         self.say("TODOS.md changed on disk — reloaded; your text is in the add box");
     }
 
@@ -613,8 +624,12 @@ impl App {
                         self.reloads += 1; // new rows above anything below it
                     }
                     self.last_new_list = created;
+                    None
+                } else {
+                    // The name row goes away again (unless the panel is too narrow for the
+                    // top-row button, where it stays as "+ New list").
+                    rows.iter().position(|r| r.kind == RowKind::NewList).filter(|_| ui::new_list_button(self.area.width).is_some())
                 }
-                None
             }
             other => {
                 self.focus = other;
@@ -838,6 +853,7 @@ impl App {
             },
             Focus::List => self.list_key(key),
         }
+        self.fit_input();
         // Typing can grow a wrapped line past the bottom: keep it on screen.
         if self.writing() {
             self.keep_visible();
@@ -853,6 +869,8 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('a') | KeyCode::Char('i') | KeyCode::Char('/') => self.focus = Focus::Input,
+            KeyCode::Char('n') => self.new_line_from_cursor(cursor.as_ref()),
+            KeyCode::Char('l') => self.focus = Focus::NewList { line: LineEdit::default() },
             KeyCode::Char('t') => self.phosphor ^= true,
             // Not mid-drag: the drag's rows were laid out from the file as it was.
             KeyCode::Char('r') | KeyCode::Char('R') if matches!(self.gesture, Gesture::None) => self.reload(),
@@ -907,6 +925,19 @@ impl App {
             _ => {}
         }
         self.keep_visible();
+    }
+
+    /// `n`: a new todo right below the selected one, at its level. With nothing selected (or a
+    /// ticked todo in Done, where new todos don't go), at the end of the first open list; with
+    /// no open list, the quick-add box.
+    fn new_line_from_cursor(&mut self, cursor: Option<&ItemRef>) {
+        if let Some(at) = cursor.filter(|at| at.depth() > 0 || !self.doc.lists[at.list].is_done()) {
+            return self.start_new(Place { list: at.list, parent: at.parent().to_vec(), slot: at.index() + 1 });
+        }
+        match self.doc.display_order().into_iter().find(|&l| !self.doc.lists[l].is_done()) {
+            Some(list) => self.start_new(Place { list, parent: Vec::new(), slot: self.doc.lists[list].end_slot() }),
+            None => self.focus = Focus::Input,
+        }
     }
 
     /// Delete a todo with everything under it, and say how to get it back.
@@ -1003,7 +1034,7 @@ impl App {
         {
             let col = m.column.saturating_sub(self.area.x);
             if col >= row.text_start() {
-                let chr = (col - row.text_start()) as usize;
+                let chr = ui::col_to_char(&row.text, (col - row.text_start()) as usize);
                 let pos = row.offset + chr;
                 if let Focus::Edit { line, .. } | Focus::New { line, .. } = &mut self.focus {
                     line.set_pos(pos);
@@ -1027,8 +1058,22 @@ impl App {
             return;
         }
         if m.row == self.area.y {
-            self.focus = Focus::Input;
+            let col = m.column.saturating_sub(self.area.x);
             self.cursor = None;
+            if ui::new_list_button(self.area.width).is_some_and(|b| col >= b) {
+                self.focus = Focus::NewList { line: LineEdit::default() };
+                self.keep_visible();
+            } else {
+                // Put the text cursor where the click landed, in the text as it was showing.
+                let shown_from = if matches!(self.focus, Focus::Input) { self.input_scroll } else { 0 };
+                if col >= 2 {
+                    let shown = ui::input_view(&self.input.text(), shown_from, ui::input_width(self.area.width));
+                    self.input.set_pos(shown_from + ui::col_to_char(&shown, (col - 2) as usize));
+                }
+                self.input_scroll = shown_from;
+                self.focus = Focus::Input;
+                self.fit_input();
+            }
             return;
         }
         if matches!(self.focus, Focus::Input) {
@@ -1044,6 +1089,7 @@ impl App {
         let col = m.column.saturating_sub(self.area.x);
         match row.kind {
             RowKind::AddHere => self.start_new(row.drop.clone()),
+            // Only on a panel too narrow for the top-row button.
             RowKind::NewList => {
                 self.focus = Focus::NewList { line: LineEdit::default() };
                 self.keep_visible();
@@ -1058,7 +1104,7 @@ impl App {
             // Click a list's name to rename it (Done keeps its name: it's what makes it Done).
             // Dragging it moves the list.
             RowKind::Title if !self.doc.lists[row.list].is_done() => {
-                let pos = col.saturating_sub(2) as usize;
+                let pos = ui::col_to_char(&row.text, col.saturating_sub(2) as usize);
                 self.gesture = Gesture::PressList { list: row.list, pos, x: m.column, y: m.row };
             }
             RowKind::Item => {
@@ -1081,7 +1127,7 @@ impl App {
                 } else if row.is_first() && col <= row.check_end() {
                     let _ = self.apply(|doc| doc.toggle(&at));
                 } else if col >= row.text_start() {
-                    let pos = row.offset + (col - row.text_start()) as usize;
+                    let pos = row.offset + ui::col_to_char(&row.text, (col - row.text_start()) as usize);
                     self.gesture = Gesture::Press { at, pos: Some(pos), x: m.column, y: m.row };
                 }
             }
@@ -1129,7 +1175,7 @@ impl App {
                 let rows = self.layout();
                 let r = self.clamp_row(m.row, rows.len());
                 let col = m.column.saturating_sub(self.area.x);
-                let chr = col.saturating_sub(rows[r].text_start()) as usize;
+                let chr = ui::col_to_char(&rows[r].text, col.saturating_sub(rows[r].text_start()) as usize);
                 self.gesture = Gesture::Select { anchor, extent: (r, chr) };
             }
             Gesture::None => {}
@@ -1343,6 +1389,66 @@ mod tests {
         key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // empty line: stop
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "### Work\n- a\n\n### Home\n- milk\n- bread\n\n### Done\n- [x] d\n");
+    }
+
+    #[test]
+    fn new_list_from_the_top_row_even_when_scrolled() {
+        let todos: String = (0..30).map(|n| format!("- t{n}\n")).collect();
+        let (mut app, file) = panel("newlist-top", &format!("### Work\n{todos}\n### Done\n- [x] d\n"));
+        app.set_area(Rect { x: 0, y: 0, width: 40, height: 12 });
+        assert!(!app.layout().iter().any(|r| r.kind == RowKind::NewList), "no name row until asked");
+        app.scroll = 10;
+        let click = |app: &mut App, column| {
+            for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)] {
+                app.on_mouse(MouseEvent { kind, column, row: 0, modifiers: KeyModifiers::NONE });
+            }
+        };
+        click(&mut app, 4); // the quick-add box, not the button
+        assert!(matches!(app.focus, Focus::Input));
+        click(&mut app, 35); // "+ New list" at the right end
+        assert!(matches!(app.focus, Focus::NewList { .. }));
+        click(&mut app, 35);
+        type_text(&mut app, "Home");
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("- t29\n\n### Home\n\n### Done"));
+    }
+
+    #[test]
+    fn n_writes_below_the_selected_todo_and_l_starts_a_list() {
+        let (mut app, file) = panel("keys", "### Work\n- a\n  - a1\n- b\n\n### Home\n- h\n\n### Done\n- [x] d\n");
+        let enter = |app: &mut App, text: &str| {
+            type_text(app, text);
+            key(app, KeyCode::Esc, KeyModifiers::NONE);
+        };
+        // Nothing selected: the end of the first list.
+        app.cursor = None;
+        key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        enter(&mut app, "c");
+        // Below a selected sub-item, at its level.
+        app.cursor = Some(ItemRef { list: 0, path: vec![0, 0] });
+        key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        enter(&mut app, "a2");
+        key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        enter(&mut app, "Later");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "### Work\n- a\n  - a1\n  - a2\n- b\n- c\n\n### Home\n- h\n\n### Later\n\n### Done\n- [x] d\n"
+        );
+    }
+
+    #[test]
+    fn a_click_that_drops_an_unnamed_list_still_hits_its_target() {
+        let (mut app, file) = panel("newlist-misaim", "### Work\n- a\n\n### Done\n- [x] d1\n- [x] d2\n");
+        app.set_area(Rect { x: 0, y: 0, width: 40, height: 20 });
+        key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        // Tick off d1's box as shown, with the name row still above it.
+        let d1 = app.layout().iter().position(|r| r.text == "d1").unwrap();
+        let y = LIST_TOP + d1 as u16;
+        for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)] {
+            app.on_mouse(MouseEvent { kind, column: 3, row: y, modifiers: KeyModifiers::NONE });
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("- [x] d2") && !text.contains("- [x] d1"), "{text}");
     }
 
     #[test]

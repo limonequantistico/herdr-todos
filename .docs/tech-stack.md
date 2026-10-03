@@ -23,6 +23,7 @@ Versions checked 2026-10-02 (crates.io, PyPI, herdr releases).
 - **notify 8.2** — watches `TODOS.md`, so edits from an editor or an AI agent show up in the panel immediately.
 - **anyhow 1.0** — error handling in the binary.
 - **serde_json 1.0** — reading herdr's context JSON and CLI output.
+- **unicode-width 0.2** — how many terminal columns a character takes (emoji and CJK take 2), so wrapping, the quick-add box, the cursor and clicks line up with what's drawn. Already pulled in by ratatui, at the same version.
 
 ### `TODOS.md` reading and writing
 

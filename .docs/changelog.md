@@ -189,3 +189,13 @@
   - ran `/herdr-review` (Claude Opus): a list can now be dragged to the end when there is no Done list; a malformed state.json no longer crashes the panel; one panel no longer resets the theme another panel chose; a key press during a drag cancels it (59 tests)
 
 ---  `v0.3.0 released`
+
+### 10:31
+
+  - "+ New list" moved to the right end of the quick-add row, so it stays in view however far the lists scroll; the new list's name is typed where the list will go (60 tests)
+  - quick add handles long text: it scrolls sideways to keep the cursor in view, shows `…` where it's cut, never runs into "+ New list", and a click puts the cursor where it lands (61 tests)
+  - keys: `n` starts a new todo right below the selected one (or at the end of the first list), `l` starts naming a new list (62 tests)
+  - ran `/herdr-review` (Claude Opus): a click that drops an unnamed new list no longer lands on the row below (it could tick the wrong todo); panels too narrow for the top-row button get the in-list "+ New list" row back; wide characters in quick add left for later (63 tests)
+  - emoji and CJK text line up: wrapping, the quick-add box, the text cursor, clicks and selection count terminal columns, not characters (adds unicode-width, already in the build via ratatui) (64 tests)
+
+---  `v0.4.0 released`

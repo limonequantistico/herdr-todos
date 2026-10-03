@@ -8,13 +8,17 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Focus, Gesture};
 use crate::doc::{Doc, Entry, ItemRef, Place, items_in};
 use crate::theme::{PHOSPHOR, PLAIN, Theme};
 
-/// Row 0 is the quick-add input, row 1 a spacer; lists start here.
+/// Row 0 is the quick-add input with "+ New list" at its right end, row 1 a spacer; lists
+/// start here. Both stay put while the lists scroll.
 pub const LIST_TOP: u16 = 2;
+const NEW_LIST_LABEL: &str = "+ New list";
+const QUICK_ADD_HINT: &str = "Quick add, goes to General";
 /// Per item row, after `SUB_INDENT` columns per level: the grip (2 columns), `[ ] ` (4), text.
 const SUB_INDENT: u16 = 2;
 /// Narrowest a wrapped line of text gets, however deep the nesting.
@@ -28,7 +32,7 @@ pub enum RowKind {
     New,
     /// "+ Add a to-do" at the end of a list: click to start writing there.
     AddHere,
-    /// "+ New list", after the last list before Done.
+    /// The name of a new list being typed, where it will go: after the last list before Done.
     NewList,
     /// Placeholder for an empty Done list.
     Empty,
@@ -101,6 +105,8 @@ pub struct View<'a> {
     pub collapsed: &'a HashSet<String>,
     /// A list being dragged: only the other lists' titles show, Done last.
     pub moving_list: Option<usize>,
+    /// A new list is being named, so its row shows.
+    pub naming_list: bool,
     /// The panel width, for wrapping.
     pub width: u16,
 }
@@ -123,16 +129,52 @@ pub fn list_collapse_key(name: &str) -> String {
     format!("\u{1e}{name}")
 }
 
-/// Split `text` into rows of at most `width` chars, breaking after a space where possible.
+/// How many terminal columns `c` takes: 2 for emoji and CJK, 0 for combining marks.
+fn cells(c: char) -> usize {
+    c.width().unwrap_or(0)
+}
+
+/// The column the char at index `n` of `text` starts at (`n` past the end: the end).
+pub fn char_to_col(text: &str, n: usize) -> usize {
+    text.chars().take(n).map(cells).sum()
+}
+
+/// The index of the char drawn at column `col` of `text` (past the end: the end). Text is
+/// kept and edited by char, but drawn by column, and wide chars make the two differ.
+pub fn col_to_char(text: &str, col: usize) -> usize {
+    let mut at = 0;
+    for (i, c) in text.chars().enumerate() {
+        at += cells(c);
+        if at > col {
+            return i;
+        }
+    }
+    text.chars().count()
+}
+
+/// How many chars from `chars[start..]` fit in `width` columns.
+fn fitting(chars: &[char], start: usize, width: usize) -> usize {
+    let mut used = 0;
+    chars[start..].iter().take_while(|&&c| {
+        used += cells(c);
+        used <= width
+    }).count()
+}
+
+/// Split `text` into rows at most `width` columns wide, breaking after a space where possible.
 /// Returns (char offset, piece) pairs; always at least one, so an empty todo still has a row.
 pub fn wrap(text: &str, width: usize) -> Vec<(usize, String)> {
     let chars: Vec<char> = text.chars().collect();
     let width = width.max(MIN_WRAP);
     let mut out = Vec::new();
     let mut start = 0;
-    while chars.len() - start > width {
-        let window = &chars[start..start + width];
-        let cut = window.iter().rposition(|&c| c == ' ').filter(|&i| i > 0).map_or(width, |i| i + 1);
+    loop {
+        let fit = fitting(&chars, start, width);
+        if start + fit == chars.len() {
+            break;
+        }
+        let window = &chars[start..start + fit.max(1)];
+        let cut = window.iter().rposition(|&c| c == ' ').filter(|&i| i > 0).map_or(window.len(), |i| i + 1);
         out.push((start, chars[start..start + cut].iter().collect()));
         start += cut;
     }
@@ -144,11 +186,67 @@ fn count_items(entries: &[Entry]) -> usize {
     entries.iter().map(|e| if let Entry::Item(i) = e { 1 + count_items(&i.children) } else { 0 }).sum()
 }
 
+/// The column "+ New list" starts at on the top row, if the panel is wide enough to keep a
+/// usable quick-add box beside it. Drawing and clicks both read this.
+pub fn new_list_button(width: u16) -> Option<u16> {
+    let col = width.checked_sub(NEW_LIST_LABEL.chars().count() as u16 + 1)?;
+    (col > 2 + MIN_WRAP as u16).then_some(col)
+}
+
+/// How many columns the quick-add text gets: from after its `+ ` to one short of the button.
+pub fn input_width(width: u16) -> usize {
+    new_list_button(width).map_or(width, |b| b - 1).saturating_sub(2).max(3) as usize
+}
+
+/// The first char the quick-add box shows, so the cursor stays in view. Long text scrolls
+/// sideways: an end with hidden text shows `…`, and the cursor never sits on one. `scroll`
+/// is the last window, kept so moving the cursor back doesn't jump the text around.
+pub fn input_window(text: &str, cursor: usize, scroll: usize, width: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    // From `last` on, the rest of the text fits with a cell past it, where the cursor goes to
+    // append. Before it, the right end is cut.
+    let mut rest = 0;
+    let mut last = chars.len();
+    while last > 0 && rest + cells(chars[last - 1]) < width {
+        last -= 1;
+        rest += cells(chars[last]);
+    }
+    let mut s = scroll.min(last);
+    if s > 0 && cursor <= s {
+        s = cursor.saturating_sub(1);
+    }
+    // Off the `…` that ends a cut window: the cursor stays before its last shown char.
+    while s < last && cursor + 2 > s + fitting(&chars, s, width) {
+        s += 1;
+    }
+    s
+}
+
+/// The quick-add text as shown from char `scroll`: `width` columns at most, `…` where it's
+/// cut. It keeps one char per char of the text, so positions carry over.
+pub fn input_view(text: &str, scroll: usize, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let scroll = scroll.min(chars.len());
+    let mut shown: Vec<char> = chars[scroll..scroll + fitting(&chars, scroll, width)].to_vec();
+    let rest: usize = chars[scroll..].iter().map(|&c| cells(c)).sum();
+    if scroll > 0 && !shown.is_empty() {
+        shown[0] = '…';
+    }
+    if rest >= width
+        && let Some(c) = shown.last_mut()
+    {
+        *c = '…';
+    }
+    shown.into_iter().collect()
+}
+
 /// The list area's rows, in display order.
 pub fn rows(doc: &Doc, view: &View) -> Vec<Row> {
     let order = doc.display_order();
     let mut rows = Vec::new();
-    // "+ New list" goes after the last list that isn't Done (or first, if there's none).
+    // A new list's name is typed after the last list that isn't Done (or first, if there's none).
+    // On a panel too narrow for the top-row button, that row is always there as "+ New list".
+    let show_new_list = view.naming_list || new_list_button(view.width).is_none();
     let last_open = order.iter().rposition(|&l| !doc.lists[l].is_done());
     let new_list_row = |list: usize, slot: usize| Row {
         kind: RowKind::NewList,
@@ -170,7 +268,7 @@ pub fn rows(doc: &Doc, view: &View) -> Vec<Row> {
         }
         return rows;
     }
-    if last_open.is_none() {
+    if last_open.is_none() && show_new_list {
         rows.push(new_list_row(order.first().copied().unwrap_or(0), 0));
         if !order.is_empty() {
             rows.push(Row { kind: RowKind::Gap, ..new_list_row(order[0], 0) });
@@ -197,7 +295,7 @@ pub fn rows(doc: &Doc, view: &View) -> Vec<Row> {
         let mut title = plain(RowKind::Title, &list.name, list.start_slot());
         if count > 0 {
             let marker = if collapsed { format!("⏵ {count}") } else { "⏷".to_string() };
-            title.marker_col = view.width.saturating_sub(marker.chars().count() as u16 + 1);
+            title.marker_col = view.width.saturating_sub(Span::raw(&marker).width() as u16 + 1);
             title.marker = Some(marker);
         }
         rows.push(title);
@@ -210,7 +308,7 @@ pub fn rows(doc: &Doc, view: &View) -> Vec<Row> {
                 rows.push(plain(RowKind::Empty, "", list.end_slot()));
             }
         }
-        if last_open == Some(n) {
+        if last_open == Some(n) && show_new_list {
             rows.push(new_list_row(li, list.end_slot()));
         }
         if n + 1 < order.len() {
@@ -252,7 +350,7 @@ fn push_items(rows: &mut Vec<Row>, view: &View, entries: &[Entry], list: usize, 
             _ => saved.as_str(),
         };
         // Keep the text clear of the marker at the right edge, with a two-column gap.
-        let marker_len = marker.as_ref().map_or(0, |m| m.chars().count());
+        let marker_len = marker.as_ref().map_or(0, |m| Span::raw(m).width());
         let width = room.saturating_sub(if marker_len > 0 { marker_len + 2 } else { 0 });
         let marker_col = view.width.saturating_sub(marker_len as u16 + 1);
         let pieces = wrap(text, width);
@@ -380,15 +478,32 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Quick-add input.
     let input_area = Rect { height: 1, ..area };
     let typing = matches!(app.focus, Focus::Input);
-    let input_line = if !typing && app.input.is_empty() {
-        Line::from(vec![Span::styled("+ ", base.fg(t.accent)), Span::styled("Quick add, goes to General", dim)])
+    let button = new_list_button(area.width);
+    let field = input_width(area.width);
+    let mut input_line = if !typing && app.input.is_empty() {
+        // On a narrow panel the hint gets shorter rather than run into the button.
+        let hint = if QUICK_ADD_HINT.chars().count() < field { QUICK_ADD_HINT } else { "Quick add" };
+        vec![Span::styled("+ ", base.fg(t.accent)), Span::styled(hint, dim)]
     } else {
-        Line::from(vec![Span::styled("+ ", base.fg(t.accent)), Span::styled(app.input.text(), base)])
+        // Out of focus, long text shows from its start.
+        let scroll = if typing { app.input_scroll } else { 0 };
+        let shown = input_view(&app.input.text(), scroll, field);
+        if typing {
+            let col = char_to_col(&shown, (app.input.cursor_col() as usize).saturating_sub(scroll));
+            f.set_cursor_position(Position { x: area.x + 2 + col as u16, y: area.y });
+        }
+        vec![Span::styled("+ ", base.fg(t.accent)), Span::styled(shown, base)]
     };
-    f.render_widget(Paragraph::new(input_line), input_area);
-    if typing {
-        f.set_cursor_position(Position { x: area.x + 2 + app.input.cursor_col(), y: area.y });
+    if let Some(col) = button {
+        let used: usize = input_line.iter().map(Span::width).sum();
+        let naming = matches!(app.focus, Focus::NewList { .. });
+        input_line.push(Span::styled(" ".repeat((col as usize).saturating_sub(used)), base));
+        input_line.push(Span::styled("+ ", base.fg(t.accent)));
+        let label = &NEW_LIST_LABEL[2..];
+        input_line.push(Span::styled(label, if naming { base.add_modifier(Modifier::BOLD) } else { dim.add_modifier(Modifier::UNDERLINED) }));
     }
+    let input_line = Line::from(input_line);
+    f.render_widget(Paragraph::new(input_line), input_area);
 
     // Lists. While dragging, the item leaves its place and a slot shows where it would land.
     let mut rows = rows(&app.doc, &app.view(app.dragged()));
@@ -414,10 +529,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         rows.insert(at, Row { kind: RowKind::Slot, text: String::new(), ..rows[at.min(rows.len() - 1)].clone() });
     }
     if app.doc.lists.is_empty() {
-        // Below the "+ New list" row and its gap, which take the first two lines.
-        let hint = Rect { y: area.y + LIST_TOP + 2, height: 1, ..area };
+        // Below the new list's name and a gap, while one is being named.
+        let below = if rows.is_empty() { 0 } else { rows.len() as u16 + 1 };
+        let hint = Rect { y: area.y + LIST_TOP + below, height: 1, ..area };
         let msg = if app.has_file() {
-            "No todos in TODOS.md yet. Add one above, or start a list."
+            "No todos in TODOS.md yet. Add one above, or start a new list."
         } else {
             "No TODOS.md here yet. Add a to-do to start one."
         };
@@ -441,13 +557,14 @@ pub fn draw(f: &mut Frame, app: &App) {
                 spans.push(Span::styled("● ", base.fg(t.accent)));
                 match &app.focus {
                     Focus::EditList { list, line } if *list == row.list => {
+                        let col = char_to_col(&line.text(), line.cursor_col() as usize) as u16;
                         spans.push(Span::styled(line.text(), base.add_modifier(Modifier::BOLD)));
-                        f.set_cursor_position(Position { x: area.x + 2 + line.cursor_col(), y });
+                        f.set_cursor_position(Position { x: area.x + 2 + col, y });
                     }
                     _ => spans.push(Span::styled(row.text.clone(), name_style.add_modifier(Modifier::BOLD))),
                 }
                 if let Some(marker) = &row.marker {
-                    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                    let used: usize = spans.iter().map(Span::width).sum();
                     spans.push(Span::styled(" ".repeat((row.marker_col as usize).saturating_sub(used)), base));
                     spans.push(Span::styled(marker.clone(), base.fg(t.list_marker).add_modifier(Modifier::BOLD)));
                 }
@@ -455,8 +572,9 @@ pub fn draw(f: &mut Frame, app: &App) {
             RowKind::NewList => match &app.focus {
                 Focus::NewList { line } => {
                     spans.push(Span::styled("● ", base.fg(t.accent)));
+                    let col = char_to_col(&line.text(), line.cursor_col() as usize) as u16;
                     spans.push(Span::styled(line.text(), base.add_modifier(Modifier::BOLD)));
-                    f.set_cursor_position(Position { x: area.x + 2 + line.cursor_col(), y });
+                    f.set_cursor_position(Position { x: area.x + 2 + col, y });
                 }
                 _ => {
                     spans.push(Span::styled("+ ", dim));
@@ -516,7 +634,8 @@ pub fn draw(f: &mut Frame, app: &App) {
                     let len = row.text.chars().count();
                     let is_last = rows.get(i + 1).is_none_or(|next| next.is_first() || next.kind != row.kind);
                     if pos >= row.offset && (pos < row.offset + len || is_last) {
-                        f.set_cursor_position(Position { x: area.x + row.text_start() + (pos - row.offset) as u16, y });
+                        let col = char_to_col(&row.text, pos - row.offset) as u16;
+                        f.set_cursor_position(Position { x: area.x + row.text_start() + col, y });
                     }
                 }
                 if let Some((from, to)) = app.selection_on(i, &rows) {
@@ -530,12 +649,12 @@ pub fn draw(f: &mut Frame, app: &App) {
                     spans.push(Span::styled(row.text.clone(), text_style));
                 }
                 if let Some(marker) = &row.marker {
-                    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                    let used: usize = spans.iter().map(Span::width).sum();
                     spans.push(Span::styled(" ".repeat((row.marker_col as usize).saturating_sub(used)), row_style));
                     spans.push(Span::styled(marker.clone(), if barred { bar } else { base.fg(t.accent).add_modifier(Modifier::BOLD) }));
                 }
                 if barred {
-                    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                    let used: usize = spans.iter().map(Span::width).sum();
                     spans.push(Span::styled(" ".repeat((area.width as usize).saturating_sub(used)), bar));
                 }
             }
@@ -553,7 +672,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         let lead = (SUB_INDENT * drop_depth).min(area.width);
         let text = format!("⠿ {} {}", if item.done { "[x]" } else { "[ ]" }, item.full_text());
         // Pad to the full width so the ghost covers the drop slot under it.
-        let text = format!("{text:<width$}", width = (area.width - lead) as usize);
+        let pad = ((area.width - lead) as usize).saturating_sub(Span::raw(&text).width());
+        let text = format!("{text}{}", " ".repeat(pad));
         let ghost = Rect { x: area.x + lead, y, width: area.width - lead, height: 1 };
         f.render_widget(Paragraph::new(text).style(ghost_style), ghost);
     }
@@ -563,7 +683,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     {
         let y = (*pointer_y).clamp(area.y + LIST_TOP, area.bottom().saturating_sub(2));
         let ghost_style = if t.cursor_bar { bar } else { Style::new().bg(t.accent).fg(t.on_bar).add_modifier(Modifier::BOLD) };
-        let text = format!("{:<width$}", format!("● {}", list.name), width = area.width as usize);
+        let text = format!("● {}", list.name);
+        let text = format!("{text}{}", " ".repeat((area.width as usize).saturating_sub(Span::raw(&text).width())));
         f.render_widget(Paragraph::new(text).style(ghost_style), Rect { y, height: 1, ..area });
     }
 
@@ -605,11 +726,46 @@ mod tests {
     }
 
     #[test]
+    fn long_quick_add_text_scrolls_to_keep_the_cursor_in_view() {
+        let text = "abcdefghijklmnopqrst"; // 20 chars in a 10-cell box
+        // Short text, or the cursor near the start: from the beginning, cut on the right.
+        assert_eq!(input_window("abcde", 5, 0, 10), 0);
+        assert_eq!(input_view(text, 0, 10), "abcdefghi…");
+        // Typing at the end: the text runs off the left, the cursor sits after it.
+        let s = input_window(text, 20, 0, 10);
+        assert_eq!((s, input_view(text, s, 10)), (11, "…mnopqrst".to_string()));
+        // Moving back keeps the window until the cursor reaches the left `…`, then steps.
+        assert_eq!(input_window(text, 13, 11, 10), 11);
+        assert_eq!(input_window(text, 11, 11, 10), 10);
+        // In the middle, both ends are cut and the cursor stays off both `…`.
+        assert_eq!(input_view(text, 5, 10), "…ghijklmn…");
+        assert_eq!(input_window(text, 3, 10, 10), 2);
+        assert_eq!(input_window(text, 14, 5, 10), 6);
+    }
+
+    #[test]
+    fn wide_chars_take_two_columns_everywhere() {
+        // Emoji and CJK are two columns wide: wrapping, the quick-add box and clicks count columns.
+        assert_eq!(pieces("🍕🍕🍕🍕🍕🍕🍕🍕 night", 12), ["🍕🍕🍕🍕🍕🍕", "🍕🍕 night"]);
+        assert_eq!(pieces("Buy 🎂 and cake", 12), ["Buy 🎂 and ", "cake"]);
+        assert_eq!((char_to_col("a🎂b", 2), char_to_col("a🎂b", 9)), (3, 4));
+        // Both halves of the cake are the cake; past the end is the end.
+        assert_eq!([0, 1, 2, 3, 9].map(|c| col_to_char("a🎂b", c)), [0, 1, 1, 2, 3]);
+        // Five balloons in a 10-column box: 10 columns, no room for the cursor, so it scrolls.
+        let text = "🎈🎈🎈🎈🎈";
+        let s = input_window(text, 5, 0, 10);
+        let shown = input_view(text, s, 10);
+        assert_eq!((s, shown.as_str()), (1, "…🎈🎈🎈"));
+        assert!(char_to_col(&shown, 5 - s) < 10, "the cursor shows inside the box");
+        assert_eq!(input_view(text, 0, 10), "🎈🎈🎈🎈…");
+    }
+
+    #[test]
     fn collapsed_todos_hide_their_sub_items() {
         let doc = Doc::parse("## A\n- [ ] p\n  - [ ] c1\n    - [ ] c11\n- [ ] q\n");
         let mut collapsed = HashSet::new();
         fn view(c: &HashSet<String>) -> View<'_> {
-            View { skip: None, pending: None, editing: None, live: None, collapsed: c, moving_list: None, width: 60 }
+            View { skip: None, pending: None, editing: None, live: None, collapsed: c, moving_list: None, naming_list: false, width: 60 }
         }
         let texts = |rows: Vec<Row>| rows.into_iter().filter(|r| r.kind == RowKind::Item).map(|r| (r.text, r.marker)).collect::<Vec<_>>();
         assert_eq!(texts(rows(&doc, &view(&collapsed))), [
@@ -626,7 +782,7 @@ mod tests {
     fn the_current_blocks_guide_lights_up_on_its_rows_only() {
         let doc = Doc::parse("## A\n- [ ] p\n  - [ ] c1\n    - [ ] c11\n  - [ ] c2\n- [ ] q\n  - [ ] q1\n");
         let collapsed = HashSet::new();
-        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, width: 60 };
+        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, naming_list: false, width: 60 };
         let rows = rows(&doc, &view);
         // The block p owns (a leaf like c2 under the cursor, or p itself): guide level 0.
         let block = Some((0, vec![0]));
@@ -646,7 +802,7 @@ mod tests {
     fn guides_close_with_a_corner_on_the_last_row_of_their_block() {
         let doc = Doc::parse("## A\n- [ ] p\n  - [ ] c1\n    - [ ] g1\n  - [ ] c2\n    - [ ] g2\n- [ ] q\n");
         let collapsed = HashSet::new();
-        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, width: 60 };
+        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, naming_list: false, width: 60 };
         let rows = rows(&doc, &view);
         let drawn: Vec<String> = (0..rows.len())
             .filter(|&i| rows[i].kind == RowKind::Item)
@@ -663,7 +819,7 @@ mod tests {
         let doc = Doc::parse("## A\n- [ ] a1\n  - [ ] a11\n- [ ] a2\n\n## B\n- [ ] b1\n");
         let mut collapsed = HashSet::new();
         collapsed.insert(list_collapse_key("A"));
-        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, width: 40 };
+        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, naming_list: false, width: 40 };
         let shown: Vec<(RowKind, String, Option<String>)> =
             rows(&doc, &view).into_iter().map(|r| (r.kind, r.text, r.marker)).collect();
         assert_eq!(shown[0], (RowKind::Title, "A".into(), Some("⏵ 3".into())));

@@ -478,6 +478,7 @@ dependencies = [
  "notify",
  "ratatui",
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]
