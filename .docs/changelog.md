@@ -199,3 +199,9 @@
   - emoji and CJK text line up: wrapping, the quick-add box, the text cursor, clicks and selection count terminal columns, not characters (adds unicode-width, already in the build via ratatui) (64 tests)
 
 ---  `v0.4.0 released`
+
+## 2026-10-03
+
+### 10:58
+
+  - added an MIT license (LICENSE, `license = "MIT"` in Cargo.toml, README note), matching the herdr plugin ecosystem

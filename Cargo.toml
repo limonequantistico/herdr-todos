@@ -3,6 +3,7 @@ name = "herdr-todos"
 version = "0.1.0"
 edition = "2024"
 description = "Todo lists from a TODOS.md file, in a herdr side panel"
+license = "MIT"
 publish = false
 
 [dependencies]
