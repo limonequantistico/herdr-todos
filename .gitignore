@@ -1,0 +1,19 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Env & secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+target/
+
+# The panel's own test todos while developing it
+/TODOS.md

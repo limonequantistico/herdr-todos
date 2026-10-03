@@ -1,0 +1,17 @@
+[
+  {
+    "version": "0.1.0",
+    "date": "2026-10-03",
+    "title": "First usable todos panel",
+    "changes": [
+      "Todo lists from a TODOS.md file in a small herdr side panel",
+      "Click a todo to write in it; Return starts the next one",
+      "Drag todos to reorder them or move them between lists",
+      "Click the box to tick a todo; it moves to Done",
+      "Sub-items with Tab, indent guides, and collapsible groups",
+      "Long todos wrap; outside edits to TODOS.md show up live",
+      "Undo and redo with Ctrl+Z / Ctrl+Y, mac-style text keys",
+      "Optional green phosphor look, toggled with t"
+    ]
+  }
+]

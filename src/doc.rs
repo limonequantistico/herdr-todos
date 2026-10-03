@@ -1,0 +1,782 @@
+//! The `TODOS.md` document: parsing, writing back, and the list operations.
+//!
+//! Format: every `## Heading` starts a list; `- [ ] text` / `- [x] text` lines are items;
+//! deeper-indented items are sub-items of the item above. Every other line (notes, blank
+//! lines, other markdown) is kept exactly where it was. Items the panel hasn't changed are
+//! written back byte for byte, so opening the panel never reformats anyone's file.
+
+pub const GENERAL: &str = "General";
+pub const DONE: &str = "Done";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Doc {
+    /// Lines before the first `## ` heading.
+    pub preamble: Vec<String>,
+    pub lists: Vec<List>,
+    pub trailing_newline: bool,
+    /// Whether the file uses Windows line endings, so writing keeps them.
+    crlf: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct List {
+    pub name: String,
+    /// The heading line as written, if unchanged.
+    raw: Option<String>,
+    pub entries: Vec<Entry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    Item(Item),
+    /// Any line that isn't an item, kept verbatim.
+    Raw(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Item {
+    pub done: bool,
+    pub text: String,
+    pub children: Vec<Entry>,
+    indent: String,
+    bullet: char,
+    /// The line as written; dropped as soon as the item changes, so it's re-rendered.
+    raw: Option<String>,
+}
+
+/// An item: its list, then entry indices from the list down through sub-items.
+/// `path: [2]` is the list's third entry; `path: [2, 0]` that item's first sub-item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemRef {
+    pub list: usize,
+    pub path: Vec<usize>,
+}
+
+impl ItemRef {
+    pub fn top(list: usize, entry: usize) -> Self {
+        ItemRef { list, path: vec![entry] }
+    }
+
+    /// 0 for a top-level item, 1 for its sub-items, and so on.
+    pub fn depth(&self) -> usize {
+        self.path.len() - 1
+    }
+
+    pub fn parent(&self) -> &[usize] {
+        &self.path[..self.path.len() - 1]
+    }
+
+    pub fn index(&self) -> usize {
+        self.path[self.path.len() - 1]
+    }
+}
+
+/// A spot to put an item: a list, the path of the item whose sub-items it joins (empty for
+/// top level), and an entry index in that container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub list: usize,
+    pub parent: Vec<usize>,
+    pub slot: usize,
+}
+
+impl Item {
+    pub fn new(text: &str) -> Self {
+        Item {
+            done: false,
+            text: text.to_string(),
+            children: Vec::new(),
+            indent: String::new(),
+            bullet: '-',
+            raw: None,
+        }
+    }
+
+    fn indent_width(&self) -> usize {
+        indent_width(&self.indent)
+    }
+
+    fn set_done(&mut self, done: bool) {
+        if self.done != done {
+            self.done = done;
+            self.raw = None;
+        }
+    }
+
+    /// Move the item (and everything under it) to a new indent, keeping relative nesting.
+    fn reindent(&mut self, indent: &str) {
+        if self.indent == indent {
+            return;
+        }
+        let old = std::mem::replace(&mut self.indent, indent.to_string());
+        self.raw = None;
+        let shift = |line: &str| match line.strip_prefix(old.as_str()) {
+            Some(rest) => format!("{indent}{rest}"),
+            None => format!("{indent}  {}", line.trim_start()),
+        };
+        for child in &mut self.children {
+            match child {
+                Entry::Item(sub) => {
+                    let sub_indent = shift(&sub.indent);
+                    sub.reindent(&sub_indent);
+                }
+                Entry::Raw(line) if !line.trim().is_empty() => *line = shift(line),
+                Entry::Raw(_) => {}
+            }
+        }
+    }
+}
+
+/// Indices of the items among `entries` (skipping notes and blank lines).
+pub fn items_in(entries: &[Entry]) -> impl Iterator<Item = usize> + '_ {
+    entries.iter().enumerate().filter(|(_, e)| matches!(e, Entry::Item(_))).map(|(i, _)| i)
+}
+
+impl List {
+    fn new(name: &str) -> Self {
+        List { name: name.to_string(), raw: None, entries: Vec::new() }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.name.eq_ignore_ascii_case(DONE)
+    }
+
+    #[cfg(test)]
+    fn item(&self, entry: usize) -> Option<&Item> {
+        match self.entries.get(entry) {
+            Some(Entry::Item(item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    pub fn item_entries(&self) -> impl Iterator<Item = usize> + '_ {
+        items_in(&self.entries)
+    }
+
+    /// Where an item appended to this list goes: after the last item, before trailing notes
+    /// or blank lines.
+    pub fn end_slot(&self) -> usize {
+        self.item_entries().last().map_or(0, |i| i + 1)
+    }
+
+    /// Where an item prepended to this list goes.
+    pub fn start_slot(&self) -> usize {
+        self.item_entries().next().unwrap_or(0)
+    }
+}
+
+fn indent_width(indent: &str) -> usize {
+    indent.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
+}
+
+/// `- [ ] text` → (indent, bullet, done, text).
+fn parse_item(line: &str) -> Option<(String, char, bool, String)> {
+    let body = line.trim_start();
+    let indent = line[..line.len() - body.len()].to_string();
+    let mut chars = body.chars();
+    let bullet = chars.next().filter(|c| matches!(c, '-' | '*' | '+'))?;
+    let rest = chars.as_str().strip_prefix(' ')?;
+    let done = match rest.get(..3)? {
+        "[ ]" => false,
+        "[x]" | "[X]" => true,
+        _ => return None,
+    };
+    let after = &rest[3..];
+    let text = match after.strip_prefix(' ') {
+        Some(text) => text,
+        None if after.is_empty() => "",
+        None => return None,
+    };
+    Some((indent, bullet, done, text.to_string()))
+}
+
+/// Push `entry` into `entries`, nesting it under the last item if it's indented deeper.
+fn place(entries: &mut Vec<Entry>, entry: Entry, width: usize) {
+    if let Some(Entry::Item(last)) = entries.last_mut()
+        && width > last.indent_width()
+    {
+        return place(&mut last.children, entry, width);
+    }
+    entries.push(entry);
+}
+
+impl Doc {
+    pub fn empty() -> Self {
+        Doc { preamble: Vec::new(), lists: Vec::new(), trailing_newline: true, crlf: false }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut doc = Doc { trailing_newline: text.is_empty() || text.ends_with('\n'), crlf: text.contains("\r\n"), ..Doc::empty() };
+        // Blank lines wait for the next line to see where they belong: a blank line between
+        // two sub-items ("loose" markdown lists) stays inside their parent, so the second
+        // sub-item still nests.
+        let mut blanks: Vec<Entry> = Vec::new();
+        for line in text.lines() {
+            if let Some(name) = line.strip_prefix("## ") {
+                if let Some(list) = doc.lists.last_mut() {
+                    list.entries.append(&mut blanks);
+                }
+                doc.lists.push(List { name: name.trim().to_string(), raw: Some(line.to_string()), entries: Vec::new() });
+                continue;
+            }
+            let Some(list) = doc.lists.last_mut() else {
+                doc.preamble.push(line.to_string());
+                continue;
+            };
+            let (entry, width) = match parse_item(line) {
+                Some((indent, bullet, done, text)) => {
+                    let width = indent_width(&indent);
+                    (Entry::Item(Item { done, text, children: Vec::new(), indent, bullet, raw: Some(line.to_string()) }), width)
+                }
+                None if line.trim().is_empty() => {
+                    blanks.push(Entry::Raw(line.to_string()));
+                    continue;
+                }
+                None => (Entry::Raw(line.to_string()), indent_width(&line[..line.len() - line.trim_start().len()])),
+            };
+            for blank in blanks.drain(..) {
+                place(&mut list.entries, blank, width);
+            }
+            place(&mut list.entries, entry, width);
+        }
+        if let Some(list) = doc.lists.last_mut() {
+            list.entries.append(&mut blanks);
+        }
+        doc
+    }
+
+    pub fn render(&self) -> String {
+        let mut lines: Vec<String> = self.preamble.clone();
+        for list in &self.lists {
+            lines.push(list.raw.clone().unwrap_or_else(|| format!("## {}", list.name)));
+            render_entries(&list.entries, &mut lines);
+        }
+        let newline = if self.crlf { "\r\n" } else { "\n" };
+        let mut out = lines.join(newline);
+        if self.trailing_newline && !out.is_empty() {
+            out.push_str(newline);
+        }
+        out
+    }
+
+    pub fn item(&self, at: &ItemRef) -> Option<&Item> {
+        match self.container(at.list, at.parent())?.get(at.index()) {
+            Some(Entry::Item(item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    fn item_mut(&mut self, at: &ItemRef) -> Option<&mut Item> {
+        match self.container_mut(at.list, at.parent())?.get_mut(at.index()) {
+            Some(Entry::Item(item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    /// The entries holding an item's siblings: a list's entries, or an item's sub-items.
+    pub fn container(&self, list: usize, parent: &[usize]) -> Option<&Vec<Entry>> {
+        let mut entries = &self.lists.get(list)?.entries;
+        for &i in parent {
+            match entries.get(i) {
+                Some(Entry::Item(item)) => entries = &item.children,
+                _ => return None,
+            }
+        }
+        Some(entries)
+    }
+
+    fn container_mut(&mut self, list: usize, parent: &[usize]) -> Option<&mut Vec<Entry>> {
+        let mut entries = &mut self.lists.get_mut(list)?.entries;
+        for &i in parent {
+            match entries.get_mut(i) {
+                Some(Entry::Item(item)) => entries = &mut item.children,
+                _ => return None,
+            }
+        }
+        Some(entries)
+    }
+
+    /// Every item in display order, sub-items right after their parent.
+    pub fn all_items(&self) -> Vec<ItemRef> {
+        fn walk(entries: &[Entry], list: usize, path: &mut Vec<usize>, out: &mut Vec<ItemRef>) {
+            for i in items_in(entries) {
+                path.push(i);
+                out.push(ItemRef { list, path: path.clone() });
+                if let Entry::Item(item) = &entries[i] {
+                    walk(&item.children, list, path, out);
+                }
+                path.pop();
+            }
+        }
+        let mut out = Vec::new();
+        for list in self.display_order() {
+            walk(&self.lists[list].entries, list, &mut Vec::new(), &mut out);
+        }
+        out
+    }
+
+    /// The indent a new arrival in this container should get: its siblings', else one level
+    /// under the parent.
+    fn indent_for(&self, list: usize, parent: &[usize]) -> String {
+        let siblings = self.container(list, parent);
+        if let Some(Entry::Item(sibling)) = siblings.and_then(|s| items_in(s).next().map(|i| &s[i])) {
+            return sibling.indent.clone();
+        }
+        match parent.split_last() {
+            None => String::new(),
+            Some((&last, grand)) => match self.container(list, grand).and_then(|c| c.get(last)) {
+                Some(Entry::Item(p)) => format!("{}  ", p.indent),
+                _ => String::new(),
+            },
+        }
+    }
+
+    pub fn find_list(&self, name: &str) -> Option<usize> {
+        self.lists.iter().position(|l| l.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Lists in display order: as in the file, except Done always goes last.
+    pub fn display_order(&self) -> Vec<usize> {
+        let (mut order, done): (Vec<usize>, Vec<usize>) = (0..self.lists.len()).partition(|&i| !self.lists[i].is_done());
+        order.extend(done);
+        order
+    }
+
+    /// The General list, created at the top of the file if missing.
+    fn general(&mut self) -> usize {
+        if let Some(i) = self.find_list(GENERAL) {
+            return i;
+        }
+        let mut list = List::new(GENERAL);
+        if !self.lists.is_empty() {
+            list.entries.push(Entry::Raw(String::new()));
+        }
+        // Keep a separating blank line between the preamble and the new heading.
+        if self.preamble.last().is_some_and(|l| !l.trim().is_empty()) {
+            self.preamble.push(String::new());
+        }
+        self.lists.insert(0, list);
+        0
+    }
+
+    /// The Done list, created at the bottom of the file if missing.
+    fn done(&mut self) -> usize {
+        if let Some(i) = self.find_list(DONE) {
+            return i;
+        }
+        match self.lists.last_mut() {
+            Some(last) if !matches!(last.entries.last(), Some(Entry::Raw(l)) if l.trim().is_empty()) => {
+                last.entries.push(Entry::Raw(String::new()))
+            }
+            None if self.preamble.last().is_some_and(|l| !l.trim().is_empty()) => self.preamble.push(String::new()),
+            _ => {}
+        }
+        self.lists.push(List::new(DONE));
+        self.lists.len() - 1
+    }
+
+    /// Add a new item at the end of General. Returns where it landed.
+    pub fn add(&mut self, text: &str) -> ItemRef {
+        let list = self.general();
+        let entry = self.lists[list].end_slot();
+        self.lists[list].entries.insert(entry, Entry::Item(Item::new(text)));
+        ItemRef::top(list, entry)
+    }
+
+    pub fn edit(&mut self, at: &ItemRef, text: &str) {
+        if let Some(item) = self.item_mut(at)
+            && item.text != text
+        {
+            item.text = text.to_string();
+            item.raw = None;
+        }
+    }
+
+    /// Tick an open top-level item (it moves to the top of Done) or untick a ticked one (from
+    /// Done it goes back to the end of General; elsewhere it stays put). Sub-items tick and
+    /// untick in place, under their parent. Returns where the item ends up.
+    pub fn toggle(&mut self, at: &ItemRef) -> Option<ItemRef> {
+        let done = self.item(at)?.done;
+        let in_done = self.lists[at.list].is_done();
+        if at.depth() > 0 {
+            self.item_mut(at)?.set_done(!done);
+            return Some(at.clone());
+        }
+        if !done {
+            self.item_mut(at)?.set_done(true);
+            if in_done {
+                return Some(at.clone());
+            }
+            let to = self.done();
+            let slot = self.lists[to].start_slot();
+            return self.move_item(at, Place { list: to, parent: Vec::new(), slot });
+        }
+        self.item_mut(at)?.set_done(false);
+        if !in_done {
+            return Some(at.clone());
+        }
+        let had_general = self.find_list(GENERAL).is_some();
+        let to = self.general();
+        // Creating General inserts it at the top, shifting every other list down by one.
+        let at = if had_general { at.clone() } else { ItemRef { list: at.list + 1, ..at.clone() } };
+        let slot = self.lists[to].end_slot();
+        self.move_item(&at, Place { list: to, parent: Vec::new(), slot })
+    }
+
+    /// Drop an item at `to` (counted before the item is taken out). Dropping it at the top
+    /// level of Done ticks it; dragging a top-level item out of Done unticks it.
+    pub fn drop_item(&mut self, at: &ItemRef, to: Place) -> Option<ItemRef> {
+        let into_done = to.parent.is_empty() && self.lists.get(to.list)?.is_done();
+        let out_of_done = at.depth() == 0 && self.lists.get(at.list)?.is_done() && !into_done;
+        let item = self.item_mut(at)?;
+        if into_done {
+            item.set_done(true);
+        } else if out_of_done {
+            item.set_done(false);
+        }
+        self.move_item(at, to)
+    }
+
+    /// Insert a new, open item at `at` (at the indent of its new siblings).
+    pub fn insert(&mut self, at: &Place, text: &str) -> Option<ItemRef> {
+        let mut item = Item::new(text);
+        item.indent = self.indent_for(at.list, &at.parent);
+        let container = self.container_mut(at.list, &at.parent)?;
+        let slot = at.slot.min(container.len());
+        container.insert(slot, Entry::Item(item));
+        let mut path = at.parent.clone();
+        path.push(slot);
+        Some(ItemRef { list: at.list, path })
+    }
+
+    /// Remove an item with nothing under it. Items with sub-items or notes are never removed
+    /// this way, so clearing a parent's text can't take anything else with it.
+    pub fn remove(&mut self, at: &ItemRef) -> bool {
+        let bare = |item: &Item| item.children.iter().all(|c| matches!(c, Entry::Raw(l) if l.trim().is_empty()));
+        if !self.item(at).is_some_and(bare) {
+            return false;
+        }
+        self.container_mut(at.list, at.parent()).is_some_and(|c| {
+            c.remove(at.index());
+            true
+        })
+    }
+
+    /// Make an item the last sub-item of the item above it.
+    pub fn indent(&mut self, at: &ItemRef) -> Option<ItemRef> {
+        let siblings = self.container(at.list, at.parent())?;
+        let above = items_in(siblings).take_while(|&i| i < at.index()).last()?;
+        let Entry::Item(above_item) = &siblings[above] else { return None };
+        let slot = above_item.children.len();
+        let mut parent = at.parent().to_vec();
+        parent.push(above);
+        self.move_item(at, Place { list: at.list, parent, slot })
+    }
+
+    /// Move a sub-item out one level, right after its parent.
+    pub fn outdent(&mut self, at: &ItemRef) -> Option<ItemRef> {
+        let (&parent_index, grand) = at.parent().split_last()?;
+        self.move_item(at, Place { list: at.list, parent: grand.to_vec(), slot: parent_index + 1 })
+    }
+
+    fn move_item(&mut self, at: &ItemRef, to: Place) -> Option<ItemRef> {
+        self.item(at)?;
+        // An item can't go inside itself.
+        if to.list == at.list && to.parent.starts_with(&at.path) {
+            return None;
+        }
+        self.container(to.list, &to.parent)?;
+        let Entry::Item(mut item) = self.container_mut(at.list, at.parent())?.remove(at.index()) else {
+            unreachable!("checked above that `at` is an item")
+        };
+        // Taking the item out shifts later siblings up by one; fix the destination to match.
+        let mut to = to;
+        let d = at.depth();
+        if to.list == at.list && to.parent.len() > d && to.parent[..d] == at.path[..d] && to.parent[d] > at.path[d] {
+            to.parent[d] -= 1;
+        }
+        if to.list == at.list && to.parent == at.parent() && to.slot > at.index() {
+            to.slot -= 1;
+        }
+        let indent = self.indent_for(to.list, &to.parent);
+        item.reindent(&indent);
+        let container = self.container_mut(to.list, &to.parent)?;
+        let slot = to.slot.min(container.len());
+        container.insert(slot, Entry::Item(item));
+        let mut path = to.parent;
+        path.push(slot);
+        Some(ItemRef { list: to.list, path })
+    }
+}
+
+fn render_entries(entries: &[Entry], lines: &mut Vec<String>) {
+    for entry in entries {
+        match entry {
+            Entry::Raw(line) => lines.push(line.clone()),
+            Entry::Item(item) => {
+                lines.push(item.raw.clone().unwrap_or_else(|| {
+                    let mark = if item.done { 'x' } else { ' ' };
+                    format!("{}{} [{mark}] {}", item.indent, item.bullet, item.text).trim_end().to_string()
+                }));
+                render_entries(&item.children, lines);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn top_level(list: usize, slot: usize) -> Place {
+        Place { list, parent: Vec::new(), slot }
+    }
+
+    fn sub(list: usize, path: &[usize]) -> ItemRef {
+        ItemRef { list, path: path.to_vec() }
+    }
+
+    const SAMPLE: &str = "\
+# My project todos
+
+Some notes up here.
+
+## Work
+- [ ] Ship v0.2
+  - [ ] Write release notes
+  - [x] Fix login bug
+* [X]  oddly spaced
+- [ ] Reply to Marco
+  a note under Marco
+
+## Done
+- [x] Old thing
+";
+
+    #[test]
+    fn round_trips_unchanged() {
+        assert_eq!(Doc::parse(SAMPLE).render(), SAMPLE);
+        let no_newline = "## A\n- [ ] x";
+        assert_eq!(Doc::parse(no_newline).render(), no_newline);
+        assert_eq!(Doc::parse("").render(), "");
+    }
+
+    #[test]
+    fn parses_lists_items_and_sub_items() {
+        let doc = Doc::parse(SAMPLE);
+        assert_eq!(doc.lists.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Work", "Done"]);
+        let work = &doc.lists[0];
+        assert_eq!(work.item_entries().count(), 3);
+        let ship = work.item(0).unwrap();
+        assert_eq!(ship.text, "Ship v0.2");
+        assert_eq!(ship.children.len(), 2);
+        let odd = work.item(1).unwrap();
+        assert!(odd.done);
+        assert_eq!(odd.text, " oddly spaced");
+        let marco = work.item(2).unwrap();
+        assert_eq!(marco.children, vec![Entry::Raw("  a note under Marco".into())]);
+    }
+
+    #[test]
+    fn not_items() {
+        for line in ["-[ ] x", "- [] x", "- [y] x", "- [ ]x", "1. [ ] x", "-  [ ] x"] {
+            assert_eq!(parse_item(line), None, "{line:?}");
+        }
+        assert_eq!(parse_item("- [ ]"), Some((String::new(), '-', false, String::new())));
+    }
+
+    #[test]
+    fn add_creates_file_structure() {
+        let mut doc = Doc::parse("");
+        let at = doc.add("Buy milk");
+        assert_eq!(at, ItemRef::top(0, 0));
+        assert_eq!(doc.render(), "## General\n- [ ] Buy milk\n");
+        doc.add("Call mum");
+        assert_eq!(doc.render(), "## General\n- [ ] Buy milk\n- [ ] Call mum\n");
+    }
+
+    #[test]
+    fn add_puts_general_first_and_keeps_spacing() {
+        let mut doc = Doc::parse("# Title\n## Work\n- [ ] a\n");
+        doc.add("new");
+        assert_eq!(doc.render(), "# Title\n\n## General\n- [ ] new\n\n## Work\n- [ ] a\n");
+    }
+
+    #[test]
+    fn add_goes_after_last_item_not_after_trailing_blank() {
+        let mut doc = Doc::parse("## General\n- [ ] a\n\n## Work\n");
+        doc.add("b");
+        assert_eq!(doc.render(), "## General\n- [ ] a\n- [ ] b\n\n## Work\n");
+    }
+
+    #[test]
+    fn tick_moves_to_top_of_done_with_sub_items() {
+        let mut doc = Doc::parse(SAMPLE);
+        let at = doc.toggle(&ItemRef::top(0, 0)).unwrap();
+        assert_eq!(at, ItemRef::top(1, 0));
+        let out = doc.render();
+        assert!(out.contains("## Done\n- [x] Ship v0.2\n  - [ ] Write release notes\n  - [x] Fix login bug\n- [x] Old thing\n"), "{out}");
+        assert!(out.contains("## Work\n* [X]  oddly spaced\n"), "{out}");
+    }
+
+    #[test]
+    fn tick_creates_done_at_the_bottom() {
+        let mut doc = Doc::parse("## General\n- [ ] a\n- [ ] b\n");
+        doc.toggle(&ItemRef::top(0, 1));
+        assert_eq!(doc.render(), "## General\n- [ ] a\n\n## Done\n- [x] b\n");
+    }
+
+    #[test]
+    fn untick_in_done_returns_to_end_of_general() {
+        let mut doc = Doc::parse("## General\n- [ ] a\n\n## Done\n- [x] b\n");
+        let at = doc.toggle(&ItemRef::top(1, 0)).unwrap();
+        assert_eq!(at, ItemRef::top(0, 1));
+        assert_eq!(doc.render(), "## General\n- [ ] a\n- [ ] b\n\n## Done\n");
+    }
+
+    #[test]
+    fn untick_in_done_creates_general_when_missing() {
+        let mut doc = Doc::parse("## Work\n- [ ] a\n\n## Done\n- [x] b\n");
+        let at = doc.toggle(&ItemRef::top(1, 0)).unwrap();
+        assert_eq!(at, ItemRef::top(0, 0));
+        assert_eq!(doc.render(), "## General\n- [ ] b\n\n## Work\n- [ ] a\n\n## Done\n");
+    }
+
+    #[test]
+    fn untick_outside_done_stays_put() {
+        let mut doc = Doc::parse("## Work\n- [x] a\n");
+        assert_eq!(doc.toggle(&ItemRef::top(0, 0)), Some(ItemRef::top(0, 0)));
+        assert_eq!(doc.render(), "## Work\n- [ ] a\n");
+    }
+
+    #[test]
+    fn drop_reorders_within_a_list() {
+        let mut doc = Doc::parse("## A\n- [ ] 1\n- [ ] 2\n- [ ] 3\n");
+        // Slot 3 = after the last item, counted before taking item 0 out.
+        assert_eq!(doc.drop_item(&ItemRef::top(0, 0), top_level(0, 3)), Some(ItemRef::top(0, 2)));
+        assert_eq!(doc.render(), "## A\n- [ ] 2\n- [ ] 3\n- [ ] 1\n");
+        doc.drop_item(&ItemRef::top(0, 2), top_level(0, 0));
+        assert_eq!(doc.render(), "## A\n- [ ] 1\n- [ ] 2\n- [ ] 3\n");
+    }
+
+    #[test]
+    fn drop_between_lists_ticks_and_unticks() {
+        let mut doc = Doc::parse("## A\n- [ ] 1\n\n## Done\n- [x] 2\n");
+        doc.drop_item(&ItemRef::top(0, 0), top_level(1, 1));
+        assert_eq!(doc.render(), "## A\n\n## Done\n- [x] 2\n- [x] 1\n");
+        doc.drop_item(&ItemRef::top(1, 0), top_level(0, 0));
+        assert_eq!(doc.render(), "## A\n- [ ] 2\n\n## Done\n- [x] 1\n");
+    }
+
+    #[test]
+    fn edit_rewrites_only_that_line() {
+        let mut doc = Doc::parse("## A\n*   [ ] keep me\n- [ ] old\n");
+        doc.edit(&ItemRef::top(0, 1), "new");
+        assert_eq!(doc.render(), "## A\n*   [ ] keep me\n- [ ] new\n");
+    }
+
+    #[test]
+    fn done_goes_last_in_display_order() {
+        let doc = Doc::parse("## Done\n## A\n## B\n");
+        assert_eq!(doc.display_order(), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn sub_items_tick_in_place() {
+        let mut doc = Doc::parse("## A\n- [ ] parent\n  - [ ] child\n");
+        assert_eq!(doc.toggle(&sub(0, &[0, 0])), Some(sub(0, &[0, 0])));
+        assert_eq!(doc.render(), "## A\n- [ ] parent\n  - [x] child\n");
+    }
+
+    #[test]
+    fn all_items_walks_sub_items_in_order() {
+        let doc = Doc::parse("## Done\n- [x] d\n## A\n- [ ] a\n  - [ ] a1\n    - [ ] a11\n- [ ] b\n");
+        assert_eq!(doc.all_items(), vec![sub(1, &[0]), sub(1, &[0, 0]), sub(1, &[0, 0, 0]), sub(1, &[1]), sub(0, &[0])]);
+    }
+
+    #[test]
+    fn dragging_a_sub_item_to_top_level_reindents_it_and_its_children() {
+        let mut doc = Doc::parse("## A\n- [ ] p\n  - [ ] c\n    - [ ] gc\n    note\n- [ ] q\n");
+        let at = doc.drop_item(&sub(0, &[0, 0]), top_level(0, 1)).unwrap();
+        assert_eq!(at, sub(0, &[1]));
+        assert_eq!(doc.render(), "## A\n- [ ] p\n- [ ] c\n  - [ ] gc\n  note\n- [ ] q\n");
+    }
+
+    #[test]
+    fn dropping_into_another_parent_adjusts_for_the_removed_item() {
+        // Moving top-level item 0 under item 2: once 0 is out, item 2 is at index 1.
+        let mut doc = Doc::parse("## A\n- [ ] x\n- [ ] y\n- [ ] z\n  - [ ] z1\n");
+        let at = doc.drop_item(&sub(0, &[0]), Place { list: 0, parent: vec![2], slot: 1 }).unwrap();
+        assert_eq!(at, sub(0, &[1, 1]));
+        assert_eq!(doc.render(), "## A\n- [ ] y\n- [ ] z\n  - [ ] z1\n  - [ ] x\n");
+    }
+
+    #[test]
+    fn an_item_cannot_go_inside_itself() {
+        let mut doc = Doc::parse("## A\n- [ ] p\n  - [ ] c\n");
+        assert_eq!(doc.drop_item(&sub(0, &[0]), Place { list: 0, parent: vec![0], slot: 0 }), None);
+        assert_eq!(doc.render(), "## A\n- [ ] p\n  - [ ] c\n");
+    }
+
+    #[test]
+    fn sub_items_dragged_into_done_are_ticked_at_top_level_only() {
+        let mut doc = Doc::parse("## A\n- [ ] p\n  - [ ] c\n\n## Done\n- [x] d\n  - [ ] d1\n");
+        doc.drop_item(&sub(0, &[0, 0]), top_level(1, 0));
+        assert_eq!(doc.render(), "## A\n- [ ] p\n\n## Done\n- [x] c\n- [x] d\n  - [ ] d1\n");
+        // A sub-item leaving Done keeps its state; only top-level items are unticked.
+        doc.drop_item(&sub(1, &[1, 0]), top_level(0, 1));
+        assert!(doc.render().starts_with("## A\n- [ ] p\n- [ ] d1\n"), "{}", doc.render());
+    }
+
+    #[test]
+    fn indent_and_outdent() {
+        let mut doc = Doc::parse("## A\n- [ ] a\n  - [ ] a1\n- [ ] b\n");
+        assert_eq!(doc.indent(&sub(0, &[0])), None, "nothing above the first item");
+        let b = doc.indent(&sub(0, &[1])).unwrap();
+        assert_eq!(b, sub(0, &[0, 1]));
+        assert_eq!(doc.render(), "## A\n- [ ] a\n  - [ ] a1\n  - [ ] b\n");
+        let b = doc.indent(&b).unwrap();
+        assert_eq!(b, sub(0, &[0, 0, 0]));
+        assert_eq!(doc.render(), "## A\n- [ ] a\n  - [ ] a1\n    - [ ] b\n");
+        let b = doc.outdent(&b).unwrap();
+        let b = doc.outdent(&b).unwrap();
+        assert_eq!(b, sub(0, &[1]));
+        assert_eq!(doc.render(), "## A\n- [ ] a\n  - [ ] a1\n- [ ] b\n");
+        assert_eq!(doc.outdent(&b), None, "already top level");
+    }
+
+    #[test]
+    fn insert_takes_the_indent_of_its_siblings() {
+        let mut doc = Doc::parse("## A\n- [ ] p\n    - [ ] c\n- [ ] q\n");
+        assert_eq!(doc.insert(&Place { list: 0, parent: vec![0], slot: 1 }, "c2"), Some(sub(0, &[0, 1])));
+        assert_eq!(doc.insert(&top_level(0, 1), "p2"), Some(sub(0, &[1])));
+        assert_eq!(doc.render(), "## A\n- [ ] p\n    - [ ] c\n    - [ ] c2\n- [ ] p2\n- [ ] q\n");
+    }
+
+    #[test]
+    fn remove_only_items_without_sub_items() {
+        let mut doc = Doc::parse("## A\n- [ ] p\n  - [ ] c\n  note\n- [ ] q\n");
+        assert!(!doc.remove(&sub(0, &[0])), "p has a sub-item");
+        assert!(doc.remove(&sub(0, &[0, 0])));
+        assert!(!doc.remove(&sub(0, &[0])), "p still has a note under it");
+        assert!(doc.remove(&sub(0, &[1])));
+        assert_eq!(doc.render(), "## A\n- [ ] p\n  note\n");
+    }
+
+    #[test]
+    fn loose_lists_keep_sub_items_under_their_parent() {
+        let text = "## A\n- [ ] p\n  - [ ] c1\n\n  - [ ] c2\n\n- [ ] q\n\n## B\n";
+        let doc = Doc::parse(text);
+        assert_eq!(doc.render(), text);
+        let p = doc.item(&sub(0, &[0])).unwrap();
+        assert_eq!(items_in(&p.children).count(), 2, "c2 is still p's sub-item");
+        assert_eq!(doc.lists[0].item_entries().count(), 2, "p and q at the top level");
+    }
+
+    #[test]
+    fn windows_line_endings_survive_an_edit() {
+        let mut doc = Doc::parse("## A\r\n- [ ] a\r\n- [ ] b\r\n");
+        doc.edit(&sub(0, &[1]), "bee");
+        assert_eq!(doc.render(), "## A\r\n- [ ] a\r\n- [ ] bee\r\n");
+    }
+}

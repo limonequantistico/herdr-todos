@@ -1,0 +1,12 @@
+[package]
+name = "herdr-todos"
+version = "0.1.0"
+edition = "2024"
+description = "Todo lists from a TODOS.md file, in a herdr side panel"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+notify = "8.2"
+ratatui = "0.30"
+serde_json = "1.0"
