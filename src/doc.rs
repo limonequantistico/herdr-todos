@@ -650,6 +650,52 @@ impl Doc {
         empty
     }
 
+    /// Move list `from` to just before list `before`, or after the last list that isn't Done
+    /// (`None`). Done can't move: it always shows last. Returns where the list landed, or
+    /// `None` if nothing moved. Blank lines are fixed up so a heading never ends up glued to
+    /// the list above it, and the unnamed list gets a heading once it isn't first.
+    pub fn move_list(&mut self, from: usize, before: Option<usize>) -> Option<usize> {
+        if self.lists.get(from).is_none_or(List::is_done) || before == Some(from) {
+            return None;
+        }
+        let ends_blank = |l: &List| matches!(l.entries.last(), Some(Entry::Raw(x)) if x.trim().is_empty());
+        let was_last = from + 1 == self.lists.len();
+        let list = self.lists.remove(from);
+        let to = match before {
+            Some(b) if b > from => b - 1,
+            Some(b) => b,
+            None => self.lists.iter().rposition(|l| !l.is_done()).map_or(0, |i| i + 1),
+        };
+        if to == from {
+            self.lists.insert(from, list);
+            return None;
+        }
+        self.lists.insert(to, list);
+        let last = self.lists.len() - 1;
+        if to < last && !ends_blank(&self.lists[to]) {
+            self.lists[to].entries.push(Entry::Raw(String::new()));
+        }
+        // The list that used to end the file now has a heading after it.
+        if to == last && ends_blank(&self.lists[to]) {
+            self.lists[to].entries.pop();
+        }
+        if was_last && to != last && ends_blank(&self.lists[last]) {
+            self.lists[last].entries.pop();
+        }
+        match to.checked_sub(1) {
+            Some(prev) if !ends_blank(&self.lists[prev]) => self.lists[prev].entries.push(Entry::Raw(String::new())),
+            None if self.preamble.last().is_some_and(|l| !l.trim().is_empty()) => self.preamble.push(String::new()),
+            _ => {}
+        }
+        for (i, l) in self.lists.iter_mut().enumerate() {
+            if l.implicit && i > 0 {
+                l.implicit = false;
+                l.raw = None;
+            }
+        }
+        Some(to)
+    }
+
     /// Make an item the last sub-item of the item above it.
     pub fn indent(&mut self, at: &ItemRef) -> Option<ItemRef> {
         let siblings = self.container(at.list, at.parent())?;
@@ -1073,6 +1119,31 @@ Possibili task emersi dalle conversazioni.
         doc.remove(&sub(1, &[0]));
         assert!(doc.remove_list(1));
         assert_eq!(doc.render(), "### A\n- a\n\n### Done\n- [x] d\n");
+    }
+
+    #[test]
+    fn moving_lists_keeps_blank_lines_between_them_and_done_last() {
+        let mut doc = Doc::parse("## A\n- a\n\n## B\n- b\n\n## Done\n- [x] d\n");
+        assert_eq!(doc.move_list(1, Some(0)), Some(0));
+        assert_eq!(doc.render(), "## B\n- b\n\n## A\n- a\n\n## Done\n- [x] d\n");
+        assert_eq!(doc.move_list(0, None), Some(1), "after the last list, still before Done");
+        assert_eq!(doc.render(), "## A\n- a\n\n## B\n- b\n\n## Done\n- [x] d\n");
+        assert_eq!(doc.move_list(2, Some(0)), None, "Done stays put");
+        assert_eq!(doc.move_list(0, Some(1)), None, "already right before B");
+
+        // No Done, no blank line at the end: the last list moving up gets one, the new last loses it.
+        let mut doc = Doc::parse("## A\n- a\n\n## B\n- b\n");
+        doc.move_list(1, Some(0));
+        assert_eq!(doc.render(), "## B\n- b\n\n## A\n- a\n");
+        doc.move_list(0, None);
+        assert_eq!(doc.render(), "## A\n- a\n\n## B\n- b\n");
+    }
+
+    #[test]
+    fn the_unnamed_list_gets_a_heading_when_another_moves_above_it() {
+        let mut doc = Doc::parse("- a\n\n## Work\n- w\n");
+        doc.move_list(1, Some(0));
+        assert_eq!(doc.render(), "## Work\n- w\n\n## General\n- a\n");
     }
 
     #[test]

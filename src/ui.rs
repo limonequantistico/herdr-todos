@@ -99,6 +99,8 @@ pub struct View<'a> {
     pub live: Option<String>,
     /// Todos whose sub-items are hidden, by `collapse_key`.
     pub collapsed: &'a HashSet<String>,
+    /// A list being dragged: only the other lists' titles show, Done last.
+    pub moving_list: Option<usize>,
     /// The panel width, for wrapping.
     pub width: u16,
 }
@@ -161,6 +163,13 @@ pub fn rows(doc: &Doc, view: &View) -> Vec<Row> {
         opens: false,
         drop: Place { list, parent: Vec::new(), slot },
     };
+    if let Some(moving) = view.moving_list {
+        for &li in order.iter().filter(|&&li| li != moving) {
+            let title = Row { kind: RowKind::Title, text: doc.lists[li].name.clone(), ..new_list_row(li, 0) };
+            rows.push(title);
+        }
+        return rows;
+    }
     if last_open.is_none() {
         rows.push(new_list_row(order.first().copied().unwrap_or(0), 0));
         if !order.is_empty() {
@@ -396,6 +405,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         drop_depth = depth;
         rows.insert(at, Row { kind: RowKind::Slot, at: None, depth, text: String::new(), offset: 0, done: false, marker: None, marker_col: 0, opens: false, ..target });
     }
+    // A list goes in above the title under the pointer (at the end, past the last title or
+    // when that's Done).
+    if let Gesture::MoveList { target_row, .. } = &app.gesture
+        && !rows.is_empty()
+    {
+        let at = (*target_row).min(rows.len());
+        rows.insert(at, Row { kind: RowKind::Slot, text: String::new(), ..rows[at.min(rows.len() - 1)].clone() });
+    }
     if app.doc.lists.is_empty() {
         // Below the "+ New list" row and its gap, which take the first two lines.
         let hint = Rect { y: area.y + LIST_TOP + 2, height: 1, ..area };
@@ -541,6 +558,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Paragraph::new(text).style(ghost_style), ghost);
     }
 
+    if let Gesture::MoveList { from, pointer_y, .. } = &app.gesture
+        && let Some(list) = app.doc.lists.get(*from)
+    {
+        let y = (*pointer_y).clamp(area.y + LIST_TOP, area.bottom().saturating_sub(2));
+        let ghost_style = if t.cursor_bar { bar } else { Style::new().bg(t.accent).fg(t.on_bar).add_modifier(Modifier::BOLD) };
+        let text = format!("{:<width$}", format!("● {}", list.name), width = area.width as usize);
+        f.render_widget(Paragraph::new(text).style(ghost_style), Rect { y, height: 1, ..area });
+    }
+
     // Status line: the last message, or key hints.
     let status_area = Rect { y: area.bottom().saturating_sub(1), height: 1, ..area };
     let status = match (&app.status, &app.focus) {
@@ -548,6 +574,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         (None, Focus::Input) => Span::styled("enter add · esc done", dim),
         (None, Focus::Edit { .. } | Focus::New { .. }) => Span::styled("enter next line · tab nest · shift+tab unnest · esc done", dim),
         (None, Focus::EditList { .. } | Focus::NewList { .. }) => Span::styled("enter save · esc done · clear an empty list's name to remove it", dim),
+        (None, Focus::List) if !app.watching => Span::styled("not watching TODOS.md for outside edits · r to reload", base.fg(t.status)),
         (None, Focus::List) => Span::styled("click to write · drag to move · click [ ] to tick · ctrl+z undo", dim),
     };
     f.render_widget(Paragraph::new(Line::from(status)), status_area);
@@ -582,7 +609,7 @@ mod tests {
         let doc = Doc::parse("## A\n- [ ] p\n  - [ ] c1\n    - [ ] c11\n- [ ] q\n");
         let mut collapsed = HashSet::new();
         fn view(c: &HashSet<String>) -> View<'_> {
-            View { skip: None, pending: None, editing: None, live: None, collapsed: c, width: 60 }
+            View { skip: None, pending: None, editing: None, live: None, collapsed: c, moving_list: None, width: 60 }
         }
         let texts = |rows: Vec<Row>| rows.into_iter().filter(|r| r.kind == RowKind::Item).map(|r| (r.text, r.marker)).collect::<Vec<_>>();
         assert_eq!(texts(rows(&doc, &view(&collapsed))), [
@@ -599,7 +626,7 @@ mod tests {
     fn the_current_blocks_guide_lights_up_on_its_rows_only() {
         let doc = Doc::parse("## A\n- [ ] p\n  - [ ] c1\n    - [ ] c11\n  - [ ] c2\n- [ ] q\n  - [ ] q1\n");
         let collapsed = HashSet::new();
-        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, width: 60 };
+        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, width: 60 };
         let rows = rows(&doc, &view);
         // The block p owns (a leaf like c2 under the cursor, or p itself): guide level 0.
         let block = Some((0, vec![0]));
@@ -619,7 +646,7 @@ mod tests {
     fn guides_close_with_a_corner_on_the_last_row_of_their_block() {
         let doc = Doc::parse("## A\n- [ ] p\n  - [ ] c1\n    - [ ] g1\n  - [ ] c2\n    - [ ] g2\n- [ ] q\n");
         let collapsed = HashSet::new();
-        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, width: 60 };
+        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, width: 60 };
         let rows = rows(&doc, &view);
         let drawn: Vec<String> = (0..rows.len())
             .filter(|&i| rows[i].kind == RowKind::Item)
@@ -636,7 +663,7 @@ mod tests {
         let doc = Doc::parse("## A\n- [ ] a1\n  - [ ] a11\n- [ ] a2\n\n## B\n- [ ] b1\n");
         let mut collapsed = HashSet::new();
         collapsed.insert(list_collapse_key("A"));
-        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, width: 40 };
+        let view = View { skip: None, pending: None, editing: None, live: None, collapsed: &collapsed, moving_list: None, width: 40 };
         let shown: Vec<(RowKind, String, Option<String>)> =
             rows(&doc, &view).into_iter().map(|r| (r.kind, r.text, r.marker)).collect();
         assert_eq!(shown[0], (RowKind::Title, "A".into(), Some("⏵ 3".into())));

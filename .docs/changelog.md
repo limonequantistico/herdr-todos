@@ -163,3 +163,29 @@
   - ran `/herdr-review` (Claude Opus): fixed clicks landing on the wrong row after a list rename/new list, delete/tick acting on a todo hidden in a collapsed list, empty-state hint overlapping "+ New list"; continuation-line flattening on edit left open
 
 ---  `v0.2.0 released`
+
+### 09:11
+
+  - clicking empty space or pressing Esc clears the selected todo; arrows pick it back up (50 tests)
+
+### 09:22
+
+  - drag a list title to reorder lists (only titles show while dragging, Done stays last); a click still renames (53 tests)
+
+### 09:31
+
+  - r reloads TODOS.md by hand; the status line says so when the file watcher could not start (54 tests)
+
+### 09:40
+
+  - an open panel restarts itself in place when its binary is rebuilt or updated (waits until nothing is being written or dragged); no more closing and reopening panes
+
+### 09:58
+
+  - theme and collapsed lists/todos are remembered (per TODOS.md, in herdr's plugin state folder); a restart on a new build also keeps undo history, selection and scroll; the binary is checked once a second (57 tests)
+
+### 10:25
+
+  - ran `/herdr-review` (Claude Opus): a list can now be dragged to the end when there is no Done list; a malformed state.json no longer crashes the panel; one panel no longer resets the theme another panel chose; a key press during a drag cancels it (59 tests)
+
+---  `v0.3.0 released`

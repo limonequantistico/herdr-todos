@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.3.0",
+    "date": "2026-10-03",
+    "title": "Panel that remembers",
+    "changes": [
+      "Drag a list's title to reorder your lists",
+      "Theme and collapsed lists are remembered for each TODOS.md",
+      "The panel restarts itself on a new build, keeping undo and selection",
+      "Press r to reload TODOS.md when outside edits don't show up",
+      "Click empty space or press Esc to clear the selection",
+      "Fixed dragging a list to the end when there's no Done list"
+    ]
+  },
+  {
     "version": "0.2.0",
     "date": "2026-10-03",
     "title": "Lists from the panel",

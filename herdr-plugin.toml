@@ -7,6 +7,9 @@ description = "Todo lists from a TODOS.md file, in a small side panel: drag to r
 
 # Builds the panel on `herdr plugin install` (needs a Rust toolchain). `herdr plugin link`
 # skips this: for a local checkout, run `cargo build --release` yourself.
+# An open panel notices the new binary and restarts itself on it, in place, keeping undo,
+# selection, theme and collapsed lists. A GitHub reinstall replaces the binary at the same
+# path, so `herdr plugin install` again is how users update.
 [[build]]
 command = ["cargo", "build", "--release", "--locked"]
 

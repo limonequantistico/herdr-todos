@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 
 use crate::clipboard;
 use crate::doc::{Doc, Entry, ItemRef, Place, items_in};
+use crate::state::{Handoff, Prefs, State};
 use crate::store::{Freshness, Store};
 use crate::ui::{self, LIST_TOP, Row, RowKind, View, collapse_key, list_collapse_key};
 
@@ -162,6 +163,11 @@ pub enum Gesture {
     /// text starts writing at char `pos`; on the grip (`pos: None`) it just selects the todo,
     /// so a drag that barely moves never opens an edit. `x`/`y` is where it started.
     Press { at: ItemRef, pos: Option<usize>, x: u16, y: u16 },
+    /// Pressed on a list's name. Moving the pointer turns it into a `MoveList`; releasing in
+    /// place starts renaming at char `pos`.
+    PressList { list: usize, pos: usize, x: u16, y: u16 },
+    /// Dragging list `from`. While it lasts only list titles show; `target_row` indexes them.
+    MoveList { from: usize, pointer_y: u16, target_row: usize },
     /// Selecting text in the line being written. Ends are (row index, char offset in the row).
     Select { anchor: (usize, usize), extent: (usize, usize) },
 }
@@ -175,9 +181,13 @@ pub struct App {
     pub gesture: Gesture,
     pub status: Option<String>,
     pub phosphor: bool,
+    /// Whether outside edits to TODOS.md show up on their own. Without a watcher (it can fail
+    /// on network drives, or when Linux runs out of watches) `r` reloads by hand.
+    pub watching: bool,
     pub scroll: usize,
     pub quit: bool,
-    /// Todos whose sub-items are hidden, by `ui::collapse_key`. Kept for this session only.
+    /// Todos and lists whose contents are hidden, by `ui::collapse_key`. Remembered per file
+    /// in the plugin's state folder.
     collapsed: HashSet<String>,
     /// The document before each change, for undo; and what undo took back, for redo. Both
     /// are dropped when the file changes on disk, so undo never reverts someone else's edit.
@@ -192,6 +202,10 @@ pub struct App {
     /// A change on disk that arrived mid-gesture or mid-writing, applied once it ends.
     reload_pending: bool,
     area: Rect,
+    /// Where the theme and collapsed todos are remembered (inside herdr only).
+    state: Option<State>,
+    /// The prefs as last saved, to write them only when they change.
+    saved: Prefs,
 }
 
 impl App {
@@ -206,6 +220,7 @@ impl App {
             gesture: Gesture::None,
             status: None,
             phosphor: false,
+            watching: true,
             scroll: 0,
             quit: false,
             collapsed: HashSet::new(),
@@ -215,12 +230,62 @@ impl App {
             last_new_list: None,
             reload_pending: false,
             area: Rect::default(),
+            state: None,
+            saved: Prefs::default(),
         };
-        app.fix_cursor();
+        // Opens on the first todo, so the keyboard works straight away.
+        app.cursor = app.doc.all_items().into_iter().next();
         if app.cursor.is_none() {
             app.focus = Focus::Input;
         }
         Ok(app)
+    }
+
+    /// Restore the theme and collapsed todos, and after a restart on a new build, what the
+    /// old panel handed over: undo history, cursor and scroll.
+    pub fn attach_state(&mut self, state: State, restarted: bool) {
+        let prefs = state.load_prefs();
+        self.phosphor = prefs.phosphor;
+        self.collapsed = prefs.collapsed.clone();
+        self.saved = prefs;
+        if restarted && let Some(h) = state.take_handoff() {
+            if h.text == self.doc.render() {
+                self.history = h.history.iter().map(|t| Doc::parse(t)).collect();
+                self.future = h.future.iter().map(|t| Doc::parse(t)).collect();
+            }
+            self.cursor = h.cursor;
+            self.fix_cursor();
+            self.scroll = h.scroll;
+        }
+        self.state = Some(state);
+    }
+
+    fn prefs(&self) -> Prefs {
+        Prefs { phosphor: self.phosphor, collapsed: self.collapsed.clone() }
+    }
+
+    /// Write the theme and collapsed todos if they changed. Called after every event.
+    pub fn save_prefs(&mut self) {
+        let prefs = self.prefs();
+        if let Some(state) = &self.state
+            && prefs != self.saved
+        {
+            state.save_prefs(&prefs, prefs.phosphor != self.saved.phosphor);
+            self.saved = prefs;
+        }
+    }
+
+    /// Leave undo history, cursor and scroll for the new build this panel restarts on.
+    pub fn hand_off(&self) {
+        if let Some(state) = &self.state {
+            state.save_handoff(&Handoff {
+                text: self.doc.render(),
+                history: self.history.iter().map(Doc::render).collect(),
+                future: self.future.iter().map(Doc::render).collect(),
+                cursor: self.cursor.clone(),
+                scroll: self.scroll,
+            });
+        }
     }
 
     /// Whether TODOS.md exists here.
@@ -268,7 +333,11 @@ impl App {
             Focus::New { line, .. } => (None, Some(line.text())),
             _ => (None, None),
         };
-        View { skip, pending: self.pending(), editing, live, collapsed: &self.collapsed, width: self.area.width }
+        let moving_list = match self.gesture {
+            Gesture::MoveList { from, .. } => Some(from),
+            _ => None,
+        };
+        View { skip, pending: self.pending(), editing, live, collapsed: &self.collapsed, moving_list, width: self.area.width }
     }
 
     /// The rows as currently shown (minus any drag).
@@ -282,6 +351,12 @@ impl App {
         self.collapsed.remove(&key);
     }
 
+    /// Whether restarting now would lose nothing: no text being written or typed into the
+    /// quick-add box, nothing being dragged.
+    pub fn can_restart(&self) -> bool {
+        !self.writing() && matches!(self.gesture, Gesture::None) && self.input.is_empty()
+    }
+
     fn writing(&self) -> bool {
         matches!(self.focus, Focus::Edit { .. } | Focus::New { .. } | Focus::EditList { .. } | Focus::NewList { .. })
     }
@@ -290,9 +365,10 @@ impl App {
         self.status = Some(msg.into());
     }
 
+    /// Nothing selected is a valid state; only a cursor on a todo that's gone is dropped.
     fn fix_cursor(&mut self) {
-        if self.cursor.as_ref().and_then(|at| self.doc.item(at)).is_none() {
-            self.cursor = self.doc.all_items().into_iter().next();
+        if self.cursor.as_ref().is_some_and(|at| self.doc.item(at).is_none()) {
+            self.cursor = None;
         }
     }
 
@@ -372,6 +448,18 @@ impl App {
         match self.store.check() {
             Ok(Freshness::Changed(doc)) => self.reloaded(doc),
             Ok(Freshness::Unchanged) => {}
+            Err(e) => self.say(format!("can't read TODOS.md: {e}")),
+        }
+    }
+
+    /// `r`: read the file again, for when nothing is watching it.
+    fn reload(&mut self) {
+        match self.store.check() {
+            Ok(Freshness::Changed(doc)) => {
+                self.reloaded(doc);
+                self.say("reloaded TODOS.md");
+            }
+            Ok(Freshness::Unchanged) => self.say("TODOS.md is up to date"),
             Err(e) => self.say(format!("can't read TODOS.md: {e}")),
         }
     }
@@ -671,6 +759,11 @@ impl App {
             return;
         }
         self.status = None;
+        // A key mid-drag drops the drag: what it holds would go stale if the key changes the file.
+        if matches!(self.gesture, Gesture::Press { .. } | Gesture::PressList { .. } | Gesture::Move { .. } | Gesture::MoveList { .. }) {
+            self.gesture = Gesture::None;
+            self.settle();
+        }
         let (ctrl, cmd, shift) = (
             key.modifiers.contains(KeyModifiers::CONTROL),
             key.modifiers.contains(KeyModifiers::SUPER),
@@ -761,15 +854,20 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('a') | KeyCode::Char('i') | KeyCode::Char('/') => self.focus = Focus::Input,
             KeyCode::Char('t') => self.phosphor ^= true,
+            // Not mid-drag: the drag's rows were laid out from the file as it was.
+            KeyCode::Char('r') | KeyCode::Char('R') if matches!(self.gesture, Gesture::None) => self.reload(),
+            // With nothing selected, the arrows pick up from the top or the bottom.
             KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(p) = pos {
-                    self.cursor = refs.get(p + 1).or(refs.get(p)).cloned();
-                }
+                self.cursor = match pos {
+                    Some(p) => refs.get(p + 1).or(refs.get(p)).cloned(),
+                    None => refs.first().cloned(),
+                };
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(p) = pos {
-                    self.cursor = refs.get(p.saturating_sub(1)).cloned();
-                }
+                self.cursor = match pos {
+                    Some(p) => refs.get(p.saturating_sub(1)).cloned(),
+                    None => refs.last().cloned(),
+                };
             }
             KeyCode::Char('g') | KeyCode::Home => self.cursor = refs.first().cloned(),
             KeyCode::Char('G') | KeyCode::End => self.cursor = refs.last().cloned(),
@@ -802,7 +900,10 @@ impl App {
                     self.delete(&at);
                 }
             }
-            KeyCode::Esc => self.gesture = Gesture::None,
+            KeyCode::Esc => {
+                self.gesture = Gesture::None;
+                self.cursor = None;
+            }
             _ => {}
         }
         self.keep_visible();
@@ -869,6 +970,15 @@ impl App {
         r.min(len.saturating_sub(1))
     }
 
+    /// The title a dragged list goes in above. Past the last one means the end, unless the
+    /// last is Done: nothing goes below Done, so dropping on it already means the end.
+    fn list_target(&self, y: u16) -> usize {
+        let rows = self.layout();
+        let r = (y.saturating_sub(self.area.y + LIST_TOP) as usize) + self.scroll;
+        let done_last = rows.last().is_some_and(|row| self.doc.lists[row.list].is_done());
+        r.min(if done_last { rows.len().saturating_sub(1) } else { rows.len() })
+    }
+
     pub fn on_mouse(&mut self, m: MouseEvent) {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => self.mouse_down(m),
@@ -918,13 +1028,18 @@ impl App {
         }
         if m.row == self.area.y {
             self.focus = Focus::Input;
+            self.cursor = None;
             return;
         }
         if matches!(self.focus, Focus::Input) {
             self.focus = Focus::List;
         }
         let rows = self.layout();
-        let Some(r) = r.filter(|&r| r < rows.len()) else { return };
+        // Below the last row: clicking empty space clears the selection.
+        let Some(r) = r.filter(|&r| r < rows.len()) else {
+            self.cursor = None;
+            return;
+        };
         let row = &rows[r];
         let col = m.column.saturating_sub(self.area.x);
         match row.kind {
@@ -941,15 +1056,16 @@ impl App {
                 }
             }
             // Click a list's name to rename it (Done keeps its name: it's what makes it Done).
+            // Dragging it moves the list.
             RowKind::Title if !self.doc.lists[row.list].is_done() => {
                 let pos = col.saturating_sub(2) as usize;
-                let line = LineEdit::at(&row.text, pos);
-                self.focus = Focus::EditList { list: row.list, line };
+                self.gesture = Gesture::PressList { list: row.list, pos, x: m.column, y: m.row };
             }
             RowKind::Item => {
                 let Some(at) = row.at.clone() else { return };
                 if col < row.lead() {
-                    return; // the indent to the left of a sub-item
+                    self.cursor = None; // the indent to the left of a sub-item
+                    return;
                 }
                 self.cursor = Some(at.clone());
                 // The marker sits at the right edge; everything from just left of it counts.
@@ -969,7 +1085,8 @@ impl App {
                     self.gesture = Gesture::Press { at, pos: Some(pos), x: m.column, y: m.row };
                 }
             }
-            _ => {}
+            // Blank rows between lists, the spacer, "nothing here": empty space.
+            _ => self.cursor = None,
         }
     }
 
@@ -992,6 +1109,17 @@ impl App {
                 self.gesture = Gesture::Move { from: at, pointer_y: m.row, target_row };
             }
             Gesture::Press { .. } => {}
+            Gesture::PressList { list, x, y, .. } if m.row != y || m.column.abs_diff(x) >= 2 => {
+                self.gesture = Gesture::MoveList { from: list, pointer_y: m.row, target_row: 0 };
+                // Only titles show from here on: start from the top so they all fit.
+                self.scroll = 0;
+                self.gesture = Gesture::MoveList { from: list, pointer_y: m.row, target_row: self.list_target(m.row) };
+            }
+            Gesture::PressList { .. } => {}
+            Gesture::MoveList { from, .. } => {
+                let target_row = self.list_target(m.row);
+                self.gesture = Gesture::MoveList { from, pointer_y: m.row, target_row };
+            }
             Gesture::Move { from, .. } => {
                 let len = ui::rows(&self.doc, &self.view(Some(&from))).len();
                 let target_row = self.clamp_row(m.row, len);
@@ -1020,6 +1148,32 @@ impl App {
                     if !unmoved {
                         let _ = self.apply(|doc| doc.drop_item(&from, to));
                     }
+                }
+            }
+            Gesture::MoveList { from, target_row, .. } => {
+                // Rows laid out as during the drag: the other lists' titles, Done last.
+                let view = View { moving_list: Some(from), ..self.view(None) };
+                let rows = ui::rows(&self.doc, &view);
+                let before = rows.get(target_row).map(|r| r.list).filter(|&l| !self.doc.lists[l].is_done());
+                let cursor = self.cursor.clone();
+                let _ = self.apply(|doc| {
+                    let to = doc.move_list(from, before)?;
+                    // Lists between the old and new place shift by one.
+                    let moved = |i: usize| {
+                        if i == from {
+                            return to;
+                        }
+                        let i = if i > from { i - 1 } else { i };
+                        if i >= to { i + 1 } else { i }
+                    };
+                    cursor.map(|c| ItemRef { list: moved(c.list), ..c })
+                });
+                self.keep_visible();
+            }
+            // A click on a list's name (no drag): rename it, starting where it was clicked.
+            Gesture::PressList { list, pos, .. } => {
+                if let Some(l) = self.doc.lists.get(list) {
+                    self.focus = Focus::EditList { list, line: LineEdit::at(&l.name, pos) };
                 }
             }
             // A click on a todo's text (no drag): start writing right there.
@@ -1205,6 +1359,37 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_keeps_theme_collapsed_lists_undo_and_cursor() {
+        let (mut app, file) = panel("restart", "## A\n- [ ] a\n- [ ] b\n");
+        let dir = file.parent().unwrap().join("state");
+        app.attach_state(State::at(dir.clone(), &file), false);
+        key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+        app.collapsed.insert(list_collapse_key("A"));
+        app.cursor = Some(ItemRef::top(0, 1));
+        key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE); // tick b
+        app.save_prefs();
+        app.hand_off();
+
+        let mut next = App::open(file.parent().unwrap()).unwrap();
+        next.attach_state(State::at(dir, &file), true);
+        assert!(next.phosphor);
+        assert!(next.collapsed.contains(&list_collapse_key("A")));
+        key(&mut next, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## A\n- [ ] a\n- [ ] b\n", "undo survived");
+    }
+
+    #[test]
+    fn r_reloads_an_outside_edit_the_watcher_missed() {
+        let (mut app, file) = panel("reload", "## A\n- [ ] a\n");
+        key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(app.status.as_deref(), Some("TODOS.md is up to date"));
+        std::fs::write(&file, "## A\n- [ ] a\n- [ ] b\n").unwrap();
+        key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(app.status.as_deref(), Some("reloaded TODOS.md"));
+        assert!(app.doc.item(&ItemRef::top(0, 1)).is_some_and(|i| i.text == "b"));
+    }
+
+    #[test]
     fn a_wheel_scroll_is_not_undone_by_the_next_frame() {
         let many: String = (0..40).map(|i| format!("- [ ] todo {i}\n")).collect();
         let (mut app, _) = panel("scroll", &format!("## A\n{many}"));
@@ -1229,5 +1414,64 @@ mod tests {
         assert_eq!(app.cursor, Some(ItemRef::top(0, 0)));
         key(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    }
+
+    #[test]
+    fn dragging_a_list_title_moves_the_list_and_a_click_still_renames() {
+        let text = "## A\n- [ ] a\n\n## B\n- [ ] b\n\n## Done\n";
+        let (mut app, file) = panel("move-list", text);
+        app.set_area(Rect { x: 0, y: 0, width: 40, height: 20 });
+        let mouse = |app: &mut App, kind, column, row| app.on_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+        app.cursor = Some(ItemRef::top(1, 0)); // "b"
+        // Rows: 2 "A", 3 a, 4 add, 5 gap, 6 "B". Drag B up onto A's title.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 6);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 4, 3);
+        // While dragging only titles show: 2 "A", 3 "Done". Pointer on A: B goes above it.
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 4, 2);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 4, 2);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## B\n- [ ] b\n\n## A\n- [ ] a\n\n## Done\n");
+        assert_eq!(app.cursor, Some(ItemRef::top(0, 0)), "still on b");
+        // A click without moving renames.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 2);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 4, 2);
+        assert!(matches!(app.focus, Focus::EditList { list: 0, .. }));
+        // Dropped on Done's title: the end, still before Done.
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 2);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 4, 9);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 4, 9);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    }
+
+    #[test]
+    fn without_done_a_list_can_be_dragged_to_the_end() {
+        let (mut app, file) = panel("move-list-end", "## A\n- [ ] a\n\n## B\n- [ ] b\n\n## C\n- [ ] c\n");
+        app.set_area(Rect { x: 0, y: 0, width: 40, height: 20 });
+        let mouse = |app: &mut App, kind, row| app.on_mouse(MouseEvent { kind, column: 4, row, modifiers: KeyModifiers::NONE });
+        // Drag A's title; while dragging, titles show at 2 "B", 3 "C". Below C is the end.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 2);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 4);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 10);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 10);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## B\n- [ ] b\n\n## C\n- [ ] c\n\n## A\n- [ ] a\n");
+    }
+
+    #[test]
+    fn clicking_empty_space_or_esc_clears_the_selection() {
+        let (mut app, _) = panel("deselect", "## A\n- [ ] a\n- [ ] b\n");
+        app.set_area(Rect { x: 0, y: 0, width: 40, height: 20 });
+        let click = |app: &mut App, row| {
+            for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)] {
+                app.on_mouse(MouseEvent { kind, column: 10, row, modifiers: KeyModifiers::NONE });
+            }
+        };
+        assert_eq!(app.cursor, Some(ItemRef::top(0, 0)));
+        click(&mut app, 18);
+        assert_eq!(app.cursor, None);
+        key(&mut app, KeyCode::Backspace, KeyModifiers::NONE); // nothing to delete
+        key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.cursor, Some(ItemRef::top(0, 0)));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.cursor, None);
     }
 }

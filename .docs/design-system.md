@@ -22,7 +22,7 @@ Drafted 2026-10-03 from the mouse-drag spike (`spikes/mouse-drag/`). Symbols are
 | `status` | Transient messages ("copied: …") | `Yellow` | `dim` |
 | `list_marker` | Collapse marker on list titles, apart from the todos' (`accent`) | `Magenta` | `rgb(255,182,66)` (amber) |
 
-**Plain** uses the terminal's own colours, so it follows whatever theme the user already has. It's the default.
+**Plain** uses the terminal's own colours, so it follows whatever theme the user already has. It's the default. The chosen theme is remembered (in herdr's plugin state folder) for every panel.
 **Green phosphor** is an optional theme. Its greens were sampled from a Fallout 4 Pip-Boy screenshot; the background is pure black, like a CRT terminal. Never ship it under the Fallout or Pip-Boy names.
 
 ## Symbols (provisional)
@@ -51,20 +51,21 @@ The panel is a small right-hand herdr split, about a third of the tab when it op
 
 Sub-items shift the whole row (grip, box, text) two columns right per level, and work like any other item. The first of each two indent columns holds a `dim` `│` guide.
 
-Rows, top to bottom: quick-add box (`+ Quick add, goes to General`, `dim` when empty), a spacer, lists in `TODOS.md` order with General first, **Done** always last. Every list except Done ends with a `dim` underlined `+ Add a to-do` row, its text aligned with item text (as in Basecamp). After the last list before Done, a `dim` `+ New list` row (underlined label, aligned with list titles). One blank row between lists. Clicking a list title (except Done) edits its name in place, like a todo.
+Rows, top to bottom: quick-add box (`+ Quick add, goes to General`, `dim` when empty), a spacer, lists in `TODOS.md` order with General first, **Done** always last. Every list except Done ends with a `dim` underlined `+ Add a to-do` row, its text aligned with item text (as in Basecamp). After the last list before Done, a `dim` `+ New list` row (underlined label, aligned with list titles). One blank row between lists. Clicking a list title (except Done) edits its name in place, like a todo; dragging it moves the list. While a list is dragged only list titles show, a `┄` slot marks where it lands (above the title under the pointer; on Done, at the end), and a ghost `● name` follows the pointer. Done never moves.
 
 ## States
 
-- **Cursor** — plain: the grip turns `accent`. Phosphor: the whole row becomes a solid `fg` bar with `on_bar` text, running the full panel width.
+- **Cursor** — plain: the grip turns `accent`. Phosphor: the whole row becomes a solid `fg` bar with `on_bar` text, running the full panel width. The panel opens on the first todo. Clicking empty space (blank rows, below the lists, the quick-add box) or Esc clears it, so nothing is selected; ↓/↑ then pick up from the top/bottom.
 - **Ticked** — text crossed out and `dim`. The item moves to Done.
 - **Dragging** — the item leaves its place (with its sub-items) and the list closes up; a `dim` drop slot opens where it would land; a ghost (solid bar: `accent` in plain, `fg` in phosphor) follows the pointer row by row, indented to the level it would land at. Dropping on a row puts the item at that row's level, just before it.
 - **Text selection** — `panel` fill with `fg` text, including on the cursor row (where `on_bar` text would vanish against the fill).
 - **Writing** — the line's grip lights up (`accent`, or the bar in phosphor) and the text cursor shows where you type; no underline; the status line shows `enter next line · tab nest · esc done`. A new line being typed shows as an item row and joins the file once it has text. Esc and clicking elsewhere both save; there is no cancel.
 - **Empty list** — just the title and its `+ Add a to-do` row. An empty Done list shows a `dim` italic "nothing here" row.
 - **No `TODOS.md`** — the quick-add input is focused and a `dim` hint reads "No TODOS.md here yet. Add a to-do to start one." A file with no todos or lists yet reads "No todos in TODOS.md yet. Add one above, or start a list."
+- **Not watching** — if the file watcher can't start (network drives, Linux out of watches), the status line reads `not watching TODOS.md for outside edits · r to reload` in `status`. `r` reloads by hand whenever nothing is being written or dragged; it's left out of the normal key hints, since edits show up on their own.
 - **Markdown in todo text** (`**bold**`, `[[links]]`) is shown as written, not rendered.
 - **Long text** — wraps onto extra rows, breaking after a space where possible; later rows are aligned under the text (no grip or box). Wrapping follows the text live while typing.
-- **Collapsed** — a todo's sub-items are hidden and its marker reads `⏵ n`. Collapsing lasts for the session only. Nesting a line under a collapsed todo opens it.
+- **Collapsed** — a todo's sub-items are hidden and its marker reads `⏵ n`. Collapsed lists and todos are remembered per `TODOS.md`, across sessions. Nesting a line under a collapsed todo opens it.
 
 ## Typography
 
