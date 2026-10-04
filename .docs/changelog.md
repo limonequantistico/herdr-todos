@@ -219,3 +219,4 @@
   - README: removed the empty screenshot slot
 
 ---  `v0.5.0 released`
+  - marketplace prep: manifest and Cargo versions set to 0.5.0 (they had stayed at 0.1.0 through every cut), removed the mouse-drag spike's herdr-plugin.toml so the marketplace doesn't list it (spike code kept), set the GitHub repo description
