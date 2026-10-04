@@ -13,6 +13,11 @@
 
 pub const GENERAL: &str = "General";
 pub const DONE: &str = "Done";
+/// Hidden notes the panel keeps in `TODOS.md`, as trailing HTML comments: a ticked todo's
+/// list (`<!-- from: Work -->`, so unticking can send it back) and a list's colour
+/// (`## Work <!-- color: red -->`).
+const FROM: &str = "from";
+const COLOR: &str = "color";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Doc {
@@ -34,6 +39,8 @@ pub struct List {
     pub entries: Vec<Entry>,
     /// The unnamed list of bullets before any list heading: it has no heading line.
     implicit: bool,
+    /// The colour of the list's dot, written as `<!-- color: red -->` after its name.
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +62,8 @@ pub struct Item {
     checkbox: bool,
     /// Indented lines right below the item that continue its text, kept as written.
     cont: Vec<String>,
+    /// The list a ticked todo came from, written as `<!-- from: List -->` after its text.
+    from: Option<String>,
     /// The line as written; dropped as soon as the item changes, so it's re-rendered.
     raw: Option<String>,
 }
@@ -106,6 +115,7 @@ impl Item {
             bullet: '-',
             checkbox: true,
             cont: Vec::new(),
+            from: None,
             raw: None,
         }
     }
@@ -124,9 +134,20 @@ impl Item {
         indent_width(&self.indent)
     }
 
+    /// Unticking also forgets the list it came from.
     fn set_done(&mut self, done: bool) {
         if self.done != done {
             self.done = done;
+            self.raw = None;
+        }
+        if !done {
+            self.set_from(None);
+        }
+    }
+
+    fn set_from(&mut self, from: Option<String>) {
+        if self.from != from {
+            self.from = from;
             self.raw = None;
         }
     }
@@ -165,7 +186,7 @@ pub fn items_in(entries: &[Entry]) -> impl Iterator<Item = usize> + '_ {
 
 impl List {
     fn new(name: &str) -> Self {
-        List { name: name.to_string(), raw: None, entries: Vec::new(), implicit: false }
+        List { name: name.to_string(), raw: None, entries: Vec::new(), implicit: false, color: None }
     }
 
     pub fn is_done(&self) -> bool {
@@ -238,6 +259,28 @@ fn parse_item(line: &str) -> Option<Parsed> {
     Some(Parsed { indent, bullet, checkbox: false, done: false, text: rest.to_string() })
 }
 
+/// Split a trailing `<!-- key: value -->` note off a line's text.
+fn split_note(text: &str, key: &str) -> (String, Option<String>) {
+    let open = format!("<!-- {key}:");
+    if let Some(body) = text.trim_end().strip_suffix("-->")
+        && let Some(i) = body.rfind(&open)
+    {
+        let value = body[i + open.len()..].trim();
+        if !value.is_empty() {
+            return (body[..i].trim_end().to_string(), Some(value.to_string()));
+        }
+    }
+    (text.to_string(), None)
+}
+
+/// `text` with a `<!-- key: value -->` note after it, if there's a value.
+fn with_note(text: &str, key: &str, value: Option<&String>) -> String {
+    match value {
+        Some(value) => format!("{} <!-- {key}: {value} -->", text.trim_end()),
+        None => text.trim_end().to_string(),
+    }
+}
+
 /// The level of a markdown heading line (`## x` → 2).
 fn heading_level(line: &str) -> Option<usize> {
     let hashes = line.chars().take_while(|&c| c == '#').count();
@@ -299,8 +342,8 @@ impl Doc {
                 if let Some(list) = doc.lists.last_mut() {
                     list.entries.append(&mut blanks);
                 }
-                let name = line[level..].trim().to_string();
-                doc.lists.push(List { name, raw: Some(line.to_string()), entries: Vec::new(), implicit: false });
+                let (name, color) = split_note(line[level..].trim(), COLOR);
+                doc.lists.push(List { name, raw: Some(line.to_string()), color, ..List::new("") });
                 continue;
             }
             let item = parse_item(line);
@@ -316,14 +359,16 @@ impl Doc {
             let (entry, width) = match item {
                 Some(p) => {
                     let width = indent_width(&p.indent);
+                    let (text, from) = split_note(&p.text, FROM);
                     let item = Item {
                         done: p.done,
-                        text: p.text,
+                        text,
                         children: Vec::new(),
                         indent: p.indent,
                         bullet: p.bullet,
                         checkbox: p.checkbox,
                         cont: Vec::new(),
+                        from,
                         raw: Some(line.to_string()),
                     };
                     (Entry::Item(item), width)
@@ -359,7 +404,8 @@ impl Doc {
         let mut lines: Vec<String> = self.preamble.clone();
         for list in &self.lists {
             if !list.implicit {
-                lines.push(list.raw.clone().unwrap_or_else(|| format!("{} {}", "#".repeat(self.level), list.name)));
+                let heading = || with_note(&format!("{} {}", "#".repeat(self.level), list.name), COLOR, list.color.as_ref());
+                lines.push(list.raw.clone().unwrap_or_else(heading));
             }
             render_entries(&list.entries, &mut lines);
         }
@@ -522,8 +568,9 @@ impl Doc {
     }
 
     /// Tick an open top-level item (it moves to the top of Done) or untick a ticked one (from
-    /// Done it goes back to the end of General; elsewhere it stays put). Sub-items tick and
-    /// untick in place, under their parent. Returns where the item ends up.
+    /// Done it goes back to the end of the list it came from, else General; elsewhere it stays
+    /// put). Sub-items tick and untick in place, under their parent. Returns where the item
+    /// ends up.
     pub fn toggle(&mut self, at: &ItemRef) -> Option<ItemRef> {
         let done = self.item(at)?.done;
         let in_done = self.lists[at.list].is_done();
@@ -536,20 +583,39 @@ impl Doc {
             if in_done {
                 return Some(at.clone());
             }
+            self.remember_from(at);
             let to = self.done();
             let slot = self.lists[to].start_slot();
             return self.move_item(at, Place { list: to, parent: Vec::new(), slot });
         }
+        let from = self.item(at)?.from.clone();
         self.item_mut(at)?.set_done(false);
         if !in_done {
             return Some(at.clone());
         }
-        let had_general = self.find_list(GENERAL).is_some();
-        let to = self.general();
-        // Creating General inserts it at the top, shifting every other list down by one.
-        let at = if had_general { at.clone() } else { ItemRef { list: at.list + 1, ..at.clone() } };
+        // Back to the list it came from, if that's still around.
+        let origin = from.and_then(|name| self.find_list(&name)).filter(|&i| !self.lists[i].is_done());
+        let (to, at) = match origin {
+            Some(to) => (to, at.clone()),
+            None => {
+                let had_general = self.find_list(GENERAL).is_some();
+                // Creating General inserts it at the top, shifting every other list down by one.
+                let at = if had_general { at.clone() } else { ItemRef { list: at.list + 1, ..at.clone() } };
+                (self.general(), at)
+            }
+        };
         let slot = self.lists[to].end_slot();
         self.move_item(&at, Place { list: to, parent: Vec::new(), slot })
+    }
+
+    /// Note on an item about to go into Done which list it's leaving. General is the
+    /// fallback anyway, so it isn't written.
+    fn remember_from(&mut self, at: &ItemRef) {
+        let name = self.lists[at.list].name.clone();
+        let from = (!self.lists[at.list].is_done() && !name.eq_ignore_ascii_case(GENERAL)).then_some(name);
+        if let Some(item) = self.item_mut(at) {
+            item.set_from(from);
+        }
     }
 
     /// Drop an item at `to` (counted before the item is taken out). Dropping it at the top
@@ -557,6 +623,9 @@ impl Doc {
     pub fn drop_item(&mut self, at: &ItemRef, to: Place) -> Option<ItemRef> {
         let into_done = to.parent.is_empty() && self.lists.get(to.list)?.is_done();
         let out_of_done = at.depth() == 0 && self.lists.get(at.list)?.is_done() && !into_done;
+        if into_done && !self.lists[at.list].is_done() {
+            self.remember_from(at);
+        }
         let item = self.item_mut(at)?;
         if into_done {
             item.set_done(true);
@@ -632,12 +701,23 @@ impl Doc {
 
     /// Rename a list. The unnamed list gets a real heading this way.
     pub fn rename_list(&mut self, list: usize, name: &str) {
-        if let Some(l) = self.lists.get_mut(list)
-            && (l.name != name || l.implicit)
-        {
-            l.name = name.to_string();
-            l.raw = None;
-            l.implicit = false;
+        let Some(l) = self.lists.get_mut(list) else { return };
+        if l.name == name && !l.implicit {
+            return;
+        }
+        let old = std::mem::replace(&mut l.name, name.to_string());
+        l.raw = None;
+        l.implicit = false;
+        // Ticked todos from this list still know their way back.
+        let renamed = Some(name.to_string());
+        for list in self.lists.iter_mut().filter(|l| l.is_done()) {
+            for entry in &mut list.entries {
+                if let Entry::Item(item) = entry
+                    && item.from.as_ref().is_some_and(|f| f.eq_ignore_ascii_case(&old))
+                {
+                    item.set_from(renamed.clone());
+                }
+            }
         }
     }
 
@@ -648,6 +728,35 @@ impl Doc {
             self.lists.remove(list);
         }
         empty
+    }
+
+    /// Delete a list with everything in it. Returns it.
+    pub fn delete_list(&mut self, list: usize) -> Option<List> {
+        if list >= self.lists.len() {
+            return None;
+        }
+        let gone = self.lists.remove(list);
+        // The list above keeps its blank line before the next heading; at the end of the file
+        // it would be left trailing.
+        if list == self.lists.len()
+            && let Some(last) = self.lists.last_mut()
+        {
+            while matches!(last.entries.last(), Some(Entry::Raw(l)) if l.trim().is_empty()) {
+                last.entries.pop();
+            }
+        }
+        Some(gone)
+    }
+
+    /// Set a list's colour (`None`: the default). The unnamed list gets a heading to hold it.
+    pub fn set_list_color(&mut self, list: usize, color: Option<&str>) {
+        if let Some(l) = self.lists.get_mut(list)
+            && (l.color.as_deref() != color || (l.implicit && color.is_some()))
+        {
+            l.color = color.map(String::from);
+            l.raw = None;
+            l.implicit &= color.is_none();
+        }
     }
 
     /// Move list `from` to just before list `before`, or after the last list that isn't Done
@@ -755,7 +864,7 @@ fn render_entries(entries: &[Entry], lines: &mut Vec<String>) {
                     } else {
                         format!("{}{} {}", item.indent, item.bullet, item.text)
                     };
-                    line.trim_end().to_string()
+                    with_note(&line, FROM, item.from.as_ref())
                 }));
                 lines.extend(item.cont.iter().cloned());
                 render_entries(&item.children, lines);
@@ -863,7 +972,7 @@ Some notes up here.
         let at = doc.toggle(&ItemRef::top(0, 0)).unwrap();
         assert_eq!(at, ItemRef::top(1, 0));
         let out = doc.render();
-        assert!(out.contains("## Done\n- [x] Ship v0.2\n  - [ ] Write release notes\n  - [x] Fix login bug\n- [x] Old thing\n"), "{out}");
+        assert!(out.contains("## Done\n- [x] Ship v0.2 <!-- from: Work -->\n  - [ ] Write release notes\n  - [x] Fix login bug\n- [x] Old thing\n"), "{out}");
         assert!(out.contains("## Work\n* [X]  oddly spaced\n"), "{out}");
     }
 
@@ -880,6 +989,37 @@ Some notes up here.
         let at = doc.toggle(&ItemRef::top(1, 0)).unwrap();
         assert_eq!(at, ItemRef::top(0, 1));
         assert_eq!(doc.render(), "## General\n- [ ] a\n- [ ] b\n\n## Done\n");
+    }
+
+    #[test]
+    fn untick_in_done_returns_to_the_list_it_came_from() {
+        let mut doc = Doc::parse("## General\n- [ ] a\n\n## Work\n- [ ] b\n- [ ] c\n");
+        let at = doc.toggle(&ItemRef::top(1, 0)).unwrap();
+        assert_eq!(doc.render(), "## General\n- [ ] a\n\n## Work\n- [ ] c\n\n## Done\n- [x] b <!-- from: Work -->\n");
+        // The note survives a save and reload, and isn't part of the text.
+        let mut doc = Doc::parse(&doc.render());
+        assert_eq!(doc.item(&at).unwrap().text, "b");
+        assert_eq!(doc.toggle(&at), Some(ItemRef::top(1, 1)));
+        assert_eq!(doc.render(), "## General\n- [ ] a\n\n## Work\n- [ ] c\n- [ ] b\n\n## Done\n");
+    }
+
+    #[test]
+    fn untick_goes_to_general_when_its_list_is_gone() {
+        let mut doc = Doc::parse("## General\n- [ ] a\n\n## Done\n- [x] b <!-- from: Gone -->\n");
+        assert_eq!(doc.toggle(&ItemRef::top(1, 0)), Some(ItemRef::top(0, 1)));
+        assert_eq!(doc.render(), "## General\n- [ ] a\n- [ ] b\n\n## Done\n");
+    }
+
+    #[test]
+    fn dragging_into_done_remembers_the_list_and_renaming_follows() {
+        let mut doc = Doc::parse("## Work\n- [ ] a\n\n## Done\n");
+        doc.drop_item(&ItemRef::top(0, 0), top_level(1, 0));
+        assert_eq!(doc.render(), "## Work\n\n## Done\n- [x] a <!-- from: Work -->\n");
+        doc.rename_list(0, "Job");
+        assert_eq!(doc.render(), "## Job\n\n## Done\n- [x] a <!-- from: Job -->\n");
+        // Dragged back out, it's open again and forgets.
+        doc.drop_item(&ItemRef::top(1, 0), top_level(0, 0));
+        assert_eq!(doc.render(), "## Job\n- [ ] a\n\n## Done\n");
     }
 
     #[test]
@@ -911,9 +1051,9 @@ Some notes up here.
     fn drop_between_lists_ticks_and_unticks() {
         let mut doc = Doc::parse("## A\n- [ ] 1\n\n## Done\n- [x] 2\n");
         doc.drop_item(&ItemRef::top(0, 0), top_level(1, 1));
-        assert_eq!(doc.render(), "## A\n\n## Done\n- [x] 2\n- [x] 1\n");
+        assert_eq!(doc.render(), "## A\n\n## Done\n- [x] 2\n- [x] 1 <!-- from: A -->\n");
         doc.drop_item(&ItemRef::top(1, 0), top_level(0, 0));
-        assert_eq!(doc.render(), "## A\n- [ ] 2\n\n## Done\n- [x] 1\n");
+        assert_eq!(doc.render(), "## A\n- [ ] 2\n\n## Done\n- [x] 1 <!-- from: A -->\n");
     }
 
     #[test]
@@ -970,7 +1110,7 @@ Some notes up here.
     fn sub_items_dragged_into_done_are_ticked_at_top_level_only() {
         let mut doc = Doc::parse("## A\n- [ ] p\n  - [ ] c\n\n## Done\n- [x] d\n  - [ ] d1\n");
         doc.drop_item(&sub(0, &[0, 0]), top_level(1, 0));
-        assert_eq!(doc.render(), "## A\n- [ ] p\n\n## Done\n- [x] c\n- [x] d\n  - [ ] d1\n");
+        assert_eq!(doc.render(), "## A\n- [ ] p\n\n## Done\n- [x] c <!-- from: A -->\n- [x] d\n  - [ ] d1\n");
         // A sub-item leaving Done keeps its state; only top-level items are unticked.
         doc.drop_item(&sub(1, &[1, 0]), top_level(0, 1));
         assert!(doc.render().starts_with("## A\n- [ ] p\n- [ ] d1\n"), "{}", doc.render());
@@ -1070,7 +1210,7 @@ Possibili task emersi dalle conversazioni.
         let mut doc = Doc::parse(HANDWRITTEN);
         doc.toggle(&sub(1, &[doc.lists[1].start_slot()]));
         let out = doc.render();
-        assert!(out.ends_with("### Done\n- [x] **Provare a spiegare uno strumento** — *\"un altra cosa da provare\"* (2026-09-21). Il test\n  è se piace anche la metà dello spiegare. Vedi [[provare-strumenti]].\n"), "{out}");
+        assert!(out.ends_with("### Done\n- [x] **Provare a spiegare uno strumento** — *\"un altra cosa da provare\"* (2026-09-21). Il test <!-- from: Soldi e progetti -->\n  è se piace anche la metà dello spiegare. Vedi [[provare-strumenti]].\n"), "{out}");
     }
 
     #[test]
@@ -1119,6 +1259,32 @@ Possibili task emersi dalle conversazioni.
         doc.remove(&sub(1, &[0]));
         assert!(doc.remove_list(1));
         assert_eq!(doc.render(), "### A\n- a\n\n### Done\n- [x] d\n");
+    }
+
+    #[test]
+    fn list_colours_round_trip_and_stay_out_of_the_name() {
+        let text = "## Work <!-- color: blue -->\n- [ ] a\n";
+        let mut doc = Doc::parse(text);
+        assert_eq!((doc.lists[0].name.as_str(), doc.lists[0].color.as_deref()), ("Work", Some("blue")));
+        assert_eq!(doc.render(), text);
+        doc.rename_list(0, "Job");
+        assert_eq!(doc.render(), "## Job <!-- color: blue -->\n- [ ] a\n");
+        doc.set_list_color(0, None);
+        assert_eq!(doc.render(), "## Job\n- [ ] a\n");
+        // The unnamed list gets a heading to hold its colour.
+        let mut doc = Doc::parse("- [ ] a\n");
+        doc.set_list_color(0, Some("red"));
+        assert_eq!(doc.render(), "## General <!-- color: red -->\n- [ ] a\n");
+    }
+
+    #[test]
+    fn deleting_a_list_takes_its_todos_and_keeps_the_spacing() {
+        let mut doc = Doc::parse("## A\n- [ ] a\n\n## B\n- [ ] b\n  - [ ] b1\n\n## Done\n- [x] d\n");
+        assert_eq!(doc.delete_list(1).map(|l| l.name), Some("B".to_string()));
+        assert_eq!(doc.render(), "## A\n- [ ] a\n\n## Done\n- [x] d\n");
+        doc.delete_list(1);
+        assert_eq!(doc.render(), "## A\n- [ ] a\n");
+        assert!(doc.delete_list(5).is_none());
     }
 
     #[test]

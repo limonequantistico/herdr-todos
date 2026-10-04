@@ -7,12 +7,12 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Focus, Gesture};
 use crate::doc::{Doc, Entry, ItemRef, Place, items_in};
-use crate::theme::{PHOSPHOR, PLAIN, Theme};
+use crate::theme::{LIST_COLORS, PHOSPHOR, PLAIN, Theme, list_color_index};
 
 /// Row 0 is the quick-add input with "+ New list" at its right end, row 1 a spacer; lists
 /// start here. Both stay put while the lists scroll.
@@ -23,6 +23,8 @@ const QUICK_ADD_HINT: &str = "Quick add, goes to General";
 const SUB_INDENT: u16 = 2;
 /// Narrowest a wrapped line of text gets, however deep the nesting.
 const MIN_WRAP: usize = 12;
+/// The list menu's last entry, after the colour swatches.
+const MENU_DELETE: &str = "delete";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -182,8 +184,47 @@ pub fn wrap(text: &str, width: usize) -> Vec<(usize, String)> {
     out
 }
 
-fn count_items(entries: &[Entry]) -> usize {
+pub fn count_items(entries: &[Entry]) -> usize {
     entries.iter().map(|e| if let Entry::Item(i) = e { 1 + count_items(&i.children) } else { 0 }).sum()
+}
+
+/// What a click in the list menu landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuHit {
+    /// A swatch: an index into `LIST_COLORS`.
+    Color(usize),
+    Delete,
+}
+
+/// Columns in the list menu, from its left border: a swatch every two columns from here,
+/// then a gap and "delete".
+const MENU_SWATCH: u16 = 2;
+
+fn menu_delete_col() -> u16 {
+    MENU_SWATCH + 2 * LIST_COLORS.len() as u16 + 1
+}
+
+/// The box a list's dot opens, for a title drawn at screen row `title_y`: right under it, or
+/// above it when there's no room below (the status line stays clear).
+pub fn list_menu_rect(area: Rect, title_y: u16) -> Rect {
+    let width = (menu_delete_col() + MENU_DELETE.len() as u16 + 2).min(area.width);
+    let room_below = title_y + 4 <= area.bottom().saturating_sub(1);
+    let y = if room_below { title_y + 1 } else { title_y.saturating_sub(3) };
+    Rect { x: area.x, y, width, height: 3 }
+}
+
+/// What's under the pointer at (`x`, `y`) in the list menu at `rect`.
+pub fn list_menu_hit(rect: Rect, x: u16, y: u16) -> Option<MenuHit> {
+    if y != rect.y + 1 || x < rect.x {
+        return None;
+    }
+    let col = x - rect.x;
+    let delete = menu_delete_col();
+    if (MENU_SWATCH..delete - 1).contains(&col) {
+        Some(MenuHit::Color(((col - MENU_SWATCH) / 2) as usize))
+    } else {
+        (delete..delete + MENU_DELETE.len() as u16).contains(&col).then_some(MenuHit::Delete)
+    }
 }
 
 /// The column "+ New list" starts at on the top row, if the panel is wide enough to keep a
@@ -553,8 +594,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         let mut spans = Vec::new();
         match row.kind {
             RowKind::Title => {
-                let name_style = if app.doc.lists[row.list].is_done() { dim } else { base };
-                spans.push(Span::styled("● ", base.fg(t.accent)));
+                let list = &app.doc.lists[row.list];
+                let name_style = if list.is_done() { dim } else { base };
+                let dot = t.list_colors[list_color_index(list.color.as_deref())];
+                spans.push(Span::styled("● ", base.fg(dot)));
                 match &app.focus {
                     Focus::EditList { list, line } if *list == row.list => {
                         let col = char_to_col(&line.text(), line.cursor_col() as usize) as u16;
@@ -662,6 +705,22 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Paragraph::new(Line::from(spans)), line_area);
     }
 
+    // The menu a list's dot opens: colour swatches, the current one underlined, then delete.
+    if let Some((list, rect)) = app.list_menu() {
+        let current = list_color_index(app.doc.lists[list].color.as_deref());
+        let mut spans = vec![Span::styled(" ", base)];
+        for (i, &color) in t.list_colors.iter().enumerate() {
+            let style = if i == current { base.fg(color).add_modifier(Modifier::UNDERLINED | Modifier::BOLD) } else { base.fg(color) };
+            spans.push(Span::styled("●", style));
+            spans.push(Span::styled(" ", base));
+        }
+        spans.push(Span::styled(" ", base));
+        spans.push(Span::styled(MENU_DELETE, base.fg(t.status).add_modifier(Modifier::UNDERLINED)));
+        f.render_widget(Clear, rect);
+        let frame = Block::bordered().border_style(dim).style(base);
+        f.render_widget(Paragraph::new(Line::from(spans)).block(frame), rect);
+    }
+
     // The ghost: a solid copy of the dragged item that follows the pointer, indented to the
     // level it would land at, so nesting is visible before the drop.
     if let Gesture::Move { from, pointer_y, .. } = &app.gesture
@@ -695,6 +754,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         (None, Focus::Input) => Span::styled("enter add · esc done", dim),
         (None, Focus::Edit { .. } | Focus::New { .. }) => Span::styled("enter next line · tab nest · shift+tab unnest · esc done", dim),
         (None, Focus::EditList { .. } | Focus::NewList { .. }) => Span::styled("enter save · esc done · clear an empty list's name to remove it", dim),
+        (None, Focus::ListMenu { .. }) => Span::styled("click a colour · delete removes the list · esc close", dim),
         (None, Focus::List) if !app.watching => Span::styled("not watching TODOS.md for outside edits · r to reload", base.fg(t.status)),
         (None, Focus::List) => Span::styled("click to write · drag to move · click [ ] to tick · ctrl+z undo", dim),
     };

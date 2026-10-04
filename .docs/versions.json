@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.5.0",
+    "date": "2026-10-04",
+    "title": "Colourful lists",
+    "changes": [
+      "Click a list's dot to change its colour",
+      "Delete a whole list with its todos from the dot's menu; Ctrl+Z undoes",
+      "Drag a list by its dot as well as its name",
+      "Unticked todos go back to the list they came from",
+      "A README with install steps, a cheat sheet and a demo"
+    ]
+  },
+  {
     "version": "0.4.0",
     "date": "2026-10-03",
     "title": "Faster capture",

@@ -205,3 +205,17 @@
 ### 10:58
 
   - added an MIT license (LICENSE, `license = "MIT"` in Cargo.toml, README note), matching the herdr plugin ecosystem
+
+## 2026-10-04
+
+### 01:56
+
+  - README: install, toggle binding, TODOS.md format, mouse and key cheat sheet
+  - README: markdown example replaced by a screenshot slot; keys section notes the bottom line shows the keys for the current mode
+  - unticking a todo in Done sends it back to the list it came from (remembered as a `<!-- from: List -->` note in TODOS.md, kept up to date when the list is renamed), falling back to General (67 tests)
+  - list menu: clicking a list's dot opens colour swatches and delete; colours are saved as `<!-- color: red -->` on the heading, deleting takes the list with its todos (ctrl+z brings it back) (70 tests)
+  - lists can be dragged by their dot too; a click on the dot still opens the list menu (70 tests)
+  - README: demo GIF at the top (two screen recordings joined, `.docs/assets/imgs/demo.gif`, 2.6 MB)
+  - README: removed the empty screenshot slot
+
+---  `v0.5.0 released`

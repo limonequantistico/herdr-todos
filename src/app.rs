@@ -14,7 +14,8 @@ use crate::clipboard;
 use crate::doc::{Doc, Entry, ItemRef, Place, items_in};
 use crate::state::{Handoff, Prefs, State};
 use crate::store::{Freshness, Store};
-use crate::ui::{self, LIST_TOP, Row, RowKind, View, collapse_key, list_collapse_key};
+use crate::theme::LIST_COLORS;
+use crate::ui::{self, LIST_TOP, MenuHit, Row, RowKind, View, collapse_key, list_collapse_key};
 
 /// How many changes undo remembers.
 const HISTORY: usize = 200;
@@ -151,6 +152,8 @@ pub enum Focus {
     EditList { list: usize, line: LineEdit },
     /// Naming a new list.
     NewList { line: LineEdit },
+    /// The menu a list's dot opens: its colours, and delete.
+    ListMenu { list: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -163,9 +166,10 @@ pub enum Gesture {
     /// text starts writing at char `pos`; on the grip (`pos: None`) it just selects the todo,
     /// so a drag that barely moves never opens an edit. `x`/`y` is where it started.
     Press { at: ItemRef, pos: Option<usize>, x: u16, y: u16 },
-    /// Pressed on a list's name. Moving the pointer turns it into a `MoveList`; releasing in
-    /// place starts renaming at char `pos`.
-    PressList { list: usize, pos: usize, x: u16, y: u16 },
+    /// Pressed on a list's name or dot. Moving the pointer turns it into a `MoveList`;
+    /// releasing in place starts renaming at char `pos`, or on the dot (`pos: None`) opens the
+    /// list's menu.
+    PressList { list: usize, pos: Option<usize>, x: u16, y: u16 },
     /// Dragging list `from`. While it lasts only list titles show; `target_row` indexes them.
     MoveList { from: usize, pointer_y: u16, target_row: usize },
     /// Selecting text in the line being written. Ends are (row index, char offset in the row).
@@ -355,6 +359,22 @@ impl App {
         ui::rows(&self.doc, &self.view(None))
     }
 
+    /// The open list menu: its list, and where it's drawn (only while the title is on screen).
+    /// Drawing and clicks both read this.
+    pub fn list_menu(&self) -> Option<(usize, Rect)> {
+        let Focus::ListMenu { list } = self.focus else { return None };
+        let r = self.layout().iter().position(|r| r.kind == RowKind::Title && r.list == list)?;
+        let r = r.checked_sub(self.scroll).filter(|&r| r < ui::list_height(self.area))?;
+        Some((list, ui::list_menu_rect(self.area, self.area.y + LIST_TOP + r as u16)))
+    }
+
+    /// Close the list menu: it points at a list by position, which a change can shift.
+    fn close_menu(&mut self) {
+        if matches!(self.focus, Focus::ListMenu { .. }) {
+            self.focus = Focus::List;
+        }
+    }
+
     /// Show the sub-items of the todo at `at`.
     fn expand(&mut self, at: &ItemRef) {
         let key = collapse_key(&self.doc, at);
@@ -479,6 +499,7 @@ impl App {
     fn reloaded(&mut self, doc: Doc) {
         self.doc = doc;
         self.reloads += 1;
+        self.close_menu();
         self.history.clear();
         self.future.clear();
         self.fix_cursor();
@@ -504,6 +525,7 @@ impl App {
             stack.push(target);
             return self.say(format!("can't write TODOS.md: {e}"));
         }
+        self.close_menu();
         let current = std::mem::replace(&mut self.doc, target);
         if back { self.future.push(current) } else { self.history.push(current) }
         self.fix_cursor();
@@ -851,6 +873,14 @@ impl App {
                     line.key(key);
                 }
             },
+            Focus::ListMenu { list } => match key.code {
+                KeyCode::Delete | KeyCode::Backspace => {
+                    let list = *list;
+                    self.delete_list(list);
+                }
+                KeyCode::Esc => self.focus = Focus::List,
+                _ => {}
+            },
             Focus::List => self.list_key(key),
         }
         self.fit_input();
@@ -959,6 +989,37 @@ impl App {
         }
     }
 
+    /// Delete a list with everything in it, and say how to get it back.
+    fn delete_list(&mut self, list: usize) {
+        self.focus = Focus::List;
+        let mut gone = None;
+        if self
+            .apply(|doc| {
+                gone = doc.delete_list(list);
+                None
+            })
+            .is_ok()
+            && let Some(list) = gone
+        {
+            self.reloads += 1; // rows below it moved up
+            // The cursor counts lists by position, and they just shifted.
+            self.cursor = None;
+            let todos = ui::count_items(&list.entries);
+            let more = if todos > 0 { format!(" and {todos} todo{}", if todos == 1 { "" } else { "s" }) } else { String::new() };
+            self.say(format!("deleted list “{}”{more} · ctrl+z to undo", list.name));
+        }
+    }
+
+    /// Set a list's colour from the menu (the first swatch is the default) and close it.
+    fn color_list(&mut self, list: usize, color: usize) {
+        self.focus = Focus::List;
+        let name = LIST_COLORS.get(color).filter(|c| !c.is_empty()).copied();
+        let _ = self.apply(|doc| {
+            doc.set_list_color(list, name);
+            None
+        });
+    }
+
     /// Move the cursor item one place down (`1`) or up (`-1`) among its siblings. Top-level
     /// items cross into the next or previous list at the ends; sub-items stop there.
     fn shift(&mut self, dir: i32) {
@@ -1026,6 +1087,15 @@ impl App {
 
     fn mouse_down(&mut self, m: MouseEvent) {
         self.status = None;
+        // With the list menu open, a click picks from it; anywhere else just closes it.
+        if let Focus::ListMenu { list } = self.focus {
+            match self.list_menu().and_then(|(_, rect)| ui::list_menu_hit(rect, m.column, m.row)) {
+                Some(MenuHit::Color(c)) => self.color_list(list, c),
+                Some(MenuHit::Delete) => self.delete_list(list),
+                None => self.focus = Focus::List,
+            }
+            return;
+        }
         let mut r = self.row_at(m.row);
         // A press on the line being written moves its text cursor and may start a selection.
         if self.writing()
@@ -1094,6 +1164,16 @@ impl App {
                 self.focus = Focus::NewList { line: LineEdit::default() };
                 self.keep_visible();
             }
+            // The dot: drag to move the list, like a todo's grip; a click opens the list's menu
+            // (colours, and delete). Done never moves, so its menu opens straight away.
+            RowKind::Title if col <= 1 => {
+                if self.doc.lists[row.list].is_done() {
+                    self.cursor = None;
+                    self.focus = Focus::ListMenu { list: row.list };
+                } else {
+                    self.gesture = Gesture::PressList { list: row.list, pos: None, x: m.column, y: m.row };
+                }
+            }
             // The marker at the right edge of a list title collapses or opens the list.
             RowKind::Title if row.marker.is_some() && col + 1 >= row.marker_col => {
                 let key = list_collapse_key(&row.text);
@@ -1105,7 +1185,7 @@ impl App {
             // Dragging it moves the list.
             RowKind::Title if !self.doc.lists[row.list].is_done() => {
                 let pos = ui::col_to_char(&row.text, col.saturating_sub(2) as usize);
-                self.gesture = Gesture::PressList { list: row.list, pos, x: m.column, y: m.row };
+                self.gesture = Gesture::PressList { list: row.list, pos: Some(pos), x: m.column, y: m.row };
             }
             RowKind::Item => {
                 let Some(at) = row.at.clone() else { return };
@@ -1217,7 +1297,11 @@ impl App {
                 self.keep_visible();
             }
             // A click on a list's name (no drag): rename it, starting where it was clicked.
-            Gesture::PressList { list, pos, .. } => {
+            Gesture::PressList { list, pos: None, .. } => {
+                self.cursor = None;
+                self.focus = Focus::ListMenu { list };
+            }
+            Gesture::PressList { list, pos: Some(pos), .. } => {
                 if let Some(l) = self.doc.lists.get(list) {
                     self.focus = Focus::EditList { list, line: LineEdit::at(&l.name, pos) };
                 }
@@ -1347,7 +1431,7 @@ mod tests {
         app.start_edit(ItemRef::top(0, 0), usize::MAX); // writing in "one"
         key(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL); // redo: "one" back in Done
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## A\n- [ ] two\n\n## Done\n- [x] one\n");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## A\n- [ ] two\n\n## Done\n- [x] one <!-- from: A -->\n");
     }
 
     #[test]
@@ -1523,6 +1607,44 @@ mod tests {
     }
 
     #[test]
+    fn the_list_dot_opens_a_menu_to_colour_or_delete_the_list() {
+        let text = "## A\n- [ ] a\n\n## B\n- [ ] b\n- [ ] c\n\n## Done\n";
+        let (mut app, file) = panel("list-menu", text);
+        app.set_area(Rect { x: 0, y: 0, width: 40, height: 20 });
+        let click = |app: &mut App, column, row| {
+            for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)] {
+                app.on_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+            }
+        };
+        // Rows: 2 "A", 3 a, 4 add, 5 gap, 6 "B". The menu opens under B's title, on rows
+        // 7–9; its swatches sit on row 8 from column 2, two columns apart.
+        click(&mut app, 0, 6);
+        assert!(matches!(app.focus, Focus::ListMenu { list: 1 }));
+        click(&mut app, 4, 8); // the second swatch: red
+        assert!(matches!(app.focus, Focus::List));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## A\n- [ ] a\n\n## B <!-- color: red -->\n- [ ] b\n- [ ] c\n\n## Done\n");
+        // A click outside only closes it.
+        click(&mut app, 0, 6);
+        click(&mut app, 30, 3);
+        assert!(matches!(app.focus, Focus::List));
+        // Delete takes the list and its todos; undo brings them back, colour and all.
+        let coloured = std::fs::read_to_string(&file).unwrap();
+        click(&mut app, 0, 6);
+        key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## A\n- [ ] a\n\n## Done\n");
+        assert_eq!(app.status.as_deref(), Some("deleted list “B” and 2 todos · ctrl+z to undo"));
+        key(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), coloured);
+        // The first swatch puts the default back; "delete" in the menu deletes.
+        click(&mut app, 0, 6);
+        click(&mut app, 2, 8);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        click(&mut app, 0, 2);
+        click(&mut app, 16, 4);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "## B\n- [ ] b\n- [ ] c\n\n## Done\n");
+    }
+
+    #[test]
     fn dragging_a_list_title_moves_the_list_and_a_click_still_renames() {
         let text = "## A\n- [ ] a\n\n## B\n- [ ] b\n\n## Done\n";
         let (mut app, file) = panel("move-list", text);
@@ -1536,6 +1658,18 @@ mod tests {
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 4, 2);
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 4, 2);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "## B\n- [ ] b\n\n## A\n- [ ] a\n\n## Done\n");
+        // The dot drags too: B (now on row 2) back below A.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 2);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 4);
+        // Titles only: 2 "A", 3 "Done". On Done: the end, before Done.
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 3);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 0, 3);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert!(matches!(app.focus, Focus::List), "a drag doesn't open the menu");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 6);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 4, 2);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 4, 2);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 4, 2);
         assert_eq!(app.cursor, Some(ItemRef::top(0, 0)), "still on b");
         // A click without moving renames.
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 2);
