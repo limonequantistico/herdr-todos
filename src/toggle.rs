@@ -12,7 +12,7 @@ const EXE: &str = "herdr-todos";
 /// panel at about a third of the width.
 const NARROW_BY: &str = "0.17";
 
-fn herdr(args: &[&str]) -> Result<Value> {
+pub(crate) fn herdr(args: &[&str]) -> Result<Value> {
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
     let out = Command::new(&bin).args(args).output().with_context(|| format!("can't run {bin}"))?;
     if !out.status.success() {
@@ -21,7 +21,7 @@ fn herdr(args: &[&str]) -> Result<Value> {
     serde_json::from_slice(&out.stdout).with_context(|| format!("herdr {}: unreadable output", args.join(" ")))
 }
 
-fn str_at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
+pub(crate) fn str_at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
     path.iter().try_fold(v, |v, key| v.get(key))?.as_str().filter(|s| !s.is_empty())
 }
 

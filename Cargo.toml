@@ -1,6 +1,6 @@
 [package]
 name = "herdr-todos"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Todo lists from a TODOS.md file, in a herdr side panel"
 license = "MIT"

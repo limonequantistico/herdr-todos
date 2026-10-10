@@ -11,7 +11,7 @@ Versions checked 2026-10-02 (crates.io, PyPI, herdr releases).
   - one `[[panes]]` entrypoint (`panel`) that runs the binary;
   - one `[[actions]]` entry (`toggle`) that opens or closes the panel. herdr binds keys to *actions*, not panes, so the user adds a `[[keys.command]]` with `type = "plugin_action"` pointing at `toggle`.
 - **The "side panel" is a split pane.** herdr has no plugin sidebar API. The panel opens with `placement = "split"`, `--direction right` (herdr only splits right or down, so it can't open on the left), and is narrowed with `pane.resize`. It's a normal herdr pane after that: it can be moved, swapped, or closed like any other.
-- **Which folder?** The `toggle` action reads the focused pane from `HERDR_PLUGIN_CONTEXT_JSON`, asks `herdr pane get` for its cwd (`foreground_cwd` when available), and opens the panel with `--cwd` set to it. The panel then looks for `TODOS.md` there.
+- **Which folder?** The `toggle` action reads the focused pane from `HERDR_PLUGIN_CONTEXT_JSON`, asks `herdr pane get` for its cwd (`foreground_cwd` when available), and opens the panel with `--cwd` set to it. The panel then looks for `TODOS.md` there, and keeps following: a background thread runs `herdr pane list --workspace` once a minute and switches to the cwd of the last focused unlabelled (terminal) pane in the panel's tab, once nothing is being written or dragged.
 - **Talking to herdr** — through the CLI at `HERDR_BIN_PATH`, not the raw socket, so it works the same on every OS.
 
 ## Panel UI (Rust)

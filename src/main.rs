@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod doc;
+mod follow;
 mod state;
 mod store;
 mod theme;
@@ -9,7 +10,7 @@ mod ui;
 
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -40,19 +41,15 @@ fn panel() -> Result<()> {
         Some(dir) => PathBuf::from(dir),
         None => std::env::current_dir().context("no working directory")?,
     };
-    let mut app = App::open(&dir).with_context(|| format!("can't open TODOS.md in {}", dir.display()))?;
-    // Keep the watcher alive for the whole session; without it the panel just won't notice
-    // outside edits until the next change it makes itself.
-    let watch = store::watch(app.file()).ok();
-    app.watching = watch.is_some();
-
     let restarted = std::env::var_os(RESTARTED_ENV).is_some();
-    if let Some(state) = state::State::from_env(app.file()) {
-        app.attach_state(state, restarted);
-    }
+    let (mut app, mut watch) = open(&dir, restarted).with_context(|| format!("can't open TODOS.md in {}", dir.display()))?;
     if restarted {
         app.status = Some("restarted with the new build".into());
     }
+    let mut dir = dir;
+    let moves = follow::start(dir.clone());
+    // A folder the pane beside moved to, waiting for the panel to be free to switch.
+    let mut moved: Option<PathBuf> = None;
     let exe = std::env::current_exe().ok();
     let mut built = exe.as_deref().and_then(modified);
     // A newer executable on disk, and since when it's looked like that.
@@ -79,6 +76,23 @@ fn panel() -> Result<()> {
                     app.on_file_event();
                 }
                 app.save_prefs();
+                if let Some(rx) = &moves
+                    && let Some(to) = rx.try_iter().last()
+                {
+                    moved = Some(to);
+                }
+                // Switch once nothing would be lost, as for a restart.
+                if let Some(to) = moved.take_if(|_| app.can_restart()) {
+                    match open(&to, false) {
+                        Ok((next, w)) => {
+                            app = next;
+                            watch = w;
+                            app.status = Some(format!("showing {}", to.display()));
+                            dir = to;
+                        }
+                        Err(e) => app.status = Some(format!("can't open TODOS.md in {}: {e}", to.display())),
+                    }
+                }
                 // Look at the executable once a second: one `stat`, nothing more.
                 if checked.elapsed() < Duration::from_secs(1) {
                     continue;
@@ -108,12 +122,25 @@ fn panel() -> Result<()> {
         // Replace this process with the new build, in the same pane: exec only returns on failure.
         let Some(exe) = &exe else { return Ok(()) };
         app.hand_off();
-        let err = Command::new(exe).args(std::env::args_os().skip(1)).env(RESTARTED_ENV, "1").exec();
+        let err = Command::new(exe).args(std::env::args_os().skip(1)).env(RESTARTED_ENV, "1").env(DIR_ENV, &dir).exec();
         app.status = Some(format!("can't restart on the new build: {err}"));
         // Don't retry this build every second; the next one gets a fresh try.
         built = modified(exe);
         newer = None;
     }
+}
+
+/// The panel on `dir`'s TODOS.md, with its watcher and remembered settings. Keep the watcher
+/// alive as long as the panel; without it the panel just won't notice outside edits until the
+/// next change it makes itself.
+fn open(dir: &Path, restarted: bool) -> std::io::Result<(App, Option<store::Watch>)> {
+    let mut app = App::open(dir)?;
+    let watch = store::watch(app.file()).ok();
+    app.watching = watch.is_some();
+    if let Some(state) = state::State::from_env(app.file()) {
+        app.attach_state(state, restarted);
+    }
+    Ok((app, watch))
 }
 
 fn modified(path: &std::path::Path) -> Option<SystemTime> {

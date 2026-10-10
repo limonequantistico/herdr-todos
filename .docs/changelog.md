@@ -221,3 +221,11 @@
 ---  `v0.5.0 released`
   - marketplace prep: manifest and Cargo versions set to 0.5.0 (they had stayed at 0.1.0 through every cut), removed the mouse-drag spike's herdr-plugin.toml so the marketplace doesn't list it (spike code kept), set the GitHub repo description
   - plugin display name changed to "todos" (id and repo stay herdr-todos)
+
+## 2026-10-10
+
+### 19:47
+
+  - the panel follows the folder: it shows the TODOS.md of the terminal pane beside it in its tab, re-checked once a minute off the drawing loop, and switches only when nothing is being written or dragged; a restart on a new build keeps the folder it moved to (73 tests)
+
+---  `v0.6.0 released`

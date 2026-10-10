@@ -24,6 +24,7 @@ Update: run the install again. An open panel picks up the new build on its own.
 ## How it works
 
 - **One file per folder.** `TODOS.md` holds everything. No file yet? It's created on the first add.
+- **Follows your folder.** The panel shows the `TODOS.md` of the pane beside it: `cd` somewhere else and the todos switch within a minute (never while you're typing or dragging).
 - **Plain markdown.** `##` headings are lists, `- [ ]` / `- [x]` bullets are todos, indented bullets are sub-items. Hand-written files work as they are; anything else in the file is left alone.
 - **Done.** Ticked todos move to a **Done** list at the bottom. Untick one and it goes back to the list it came from.
 

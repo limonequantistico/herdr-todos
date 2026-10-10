@@ -83,9 +83,12 @@ impl Store {
     }
 }
 
+/// A live watch, and its signal that the file may have changed.
+pub type Watch = (RecommendedWatcher, Receiver<()>);
+
 /// Watch the folder holding `file` (not the file itself: an atomic rename replaces the file,
 /// which would end a watch on it) and signal whenever the file may have changed.
-pub fn watch(file: &Path) -> notify::Result<(RecommendedWatcher, Receiver<()>)> {
+pub fn watch(file: &Path) -> notify::Result<Watch> {
     let name = file.file_name().map(|n| n.to_owned()).unwrap_or_else(|| FILE_NAME.into());
     let dir = file.parent().unwrap_or(Path::new("."));
     let (tx, rx) = channel();

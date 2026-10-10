@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.6.0",
+    "date": "2026-10-10",
+    "title": "Follows your folder",
+    "changes": [
+      "The panel shows the todos of the folder you're working in, even after a cd",
+      "It switches on its own within a minute, never while you're typing or dragging"
+    ]
+  },
+  {
     "version": "0.5.0",
     "date": "2026-10-04",
     "title": "Colourful lists",
